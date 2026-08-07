@@ -1,0 +1,37 @@
+# Секреты
+.env
+.env.local
+.env.production
+!.env.example
+
+# База данных
+bot.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Бэкапы
+backups/
+
+# Логи
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
