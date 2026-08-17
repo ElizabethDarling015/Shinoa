@@ -12,6 +12,7 @@ bot.db
 
 # Бэкапы
 backups/
+restart_marker.json
 
 # Логи
 logs/

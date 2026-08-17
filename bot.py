@@ -4,7 +4,10 @@ Telegram Personal Organizer Bot
 """
 
 import asyncio
+import json
 import logging
+import os
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -69,48 +72,29 @@ async def cb_goodbye_close(call: CallbackQuery):
 # ──────────────────────────────────────────────
 # Рассылка приветствия при старте
 # ──────────────────────────────────────────────
+STARTUP_TEXT = "Я снова в строю!🎀 Когда начнём?😌"
+STARTUP_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="✅Сейчас!", callback_data="start_main")]
+    ]
+)
+
+
 async def send_startup_message(bot: Bot):
-    """
-    Отправляет приветственное сообщение при запуске бота.
-    Кнопка ведёт на главное меню через callback_data='start_main'.
-    """
-    text = "Я снова в строю!🎀 Когда начнём?😌"
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅Сейчас!",
-                    callback_data="start_main"
-                )
-            ]
-        ]
-    )
-
+    """Отправляет приветственное сообщение при обычном запуске бота."""
     for chat_id in ALLOWED_USERS:
         try:
-            await bot.send_message(
-                chat_id,
-                text,
-                reply_markup=keyboard,
-            )
+            await bot.send_message(chat_id, STARTUP_TEXT, reply_markup=STARTUP_KEYBOARD)
             logger.info(f"Стартовое приветствие отправлено пользователю {chat_id}")
         except TelegramForbiddenError:
-            logger.warning(
-                f"Пользователь {chat_id} заблокировал бота или ещё не нажал /start"
-            )
+            logger.warning(f"Пользователь {chat_id} заблокировал бота или ещё не нажал /start")
         except TelegramBadRequest as e:
             if "chat not found" in str(e).lower():
-                logger.warning(
-                    f"Chat not found для {chat_id}. "
-                    f"Возможно, пользователь ещё не запускал бота или указан неверный ID."
-                )
+                logger.warning(f"Chat not found для {chat_id}. Возможно, пользователь ещё не запускал бота или указан неверный ID.")
             else:
                 logger.warning(f"TelegramBadRequest для {chat_id}: {e}")
         except Exception as e:
-            logger.warning(
-                f"Не удалось отправить стартовое приветствие пользователю {chat_id}: {e}"
-            )
+            logger.warning(f"Не удалось отправить стартовое приветствие пользователю {chat_id}: {e}")
 
 
 # ──────────────────────────────────────────────
@@ -239,10 +223,27 @@ async def main():
     logger.info("Бот запущен ✅")
 
     # ──────────────────────────────────────────
-    # Приветствие при запуске бота
+    # Приветствие при запуске бота ИЛИ продолжение сообщения после update-перезапуска
     # ──────────────────────────────────────────
     try:
-        await send_startup_message(bot)
+        marker_path = Path(__file__).resolve().parent / "restart_marker.json"
+        if marker_path.exists():
+            try:
+                data = json.loads(marker_path.read_text(encoding="utf-8"))
+                await bot.edit_message_text(
+                    STARTUP_TEXT,
+                    chat_id=data["chat_id"],
+                    message_id=data["message_id"],
+                    reply_markup=STARTUP_KEYBOARD,
+                )
+                logger.info("Перезапуск после обновления: сообщение отредактировано на месте")
+            except Exception as e:
+                logger.warning("Не удалось отредактировать сообщение после обновления: %s", e)
+                await send_startup_message(bot)
+            finally:
+                marker_path.unlink(missing_ok=True)
+        else:
+            await send_startup_message(bot)
     except Exception as e:
         logger.error(f"Ошибка стартовой рассылки: {e}")
 

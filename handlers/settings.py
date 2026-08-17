@@ -7,6 +7,13 @@
 """
 
 import logging
+import asyncio
+import html
+import os
+import sys
+import json
+
+from pathlib import Path
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -19,6 +26,7 @@ from handlers.common import parse_time, remove_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class SetCity(StatesGroup):
@@ -42,10 +50,13 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🪐 Установить UTC", callback_data="settings_settimezone"),
-            InlineKeyboardButton(text="❌ Закрыть", callback_data="settings_close"),
+            InlineKeyboardButton(text="🔄 Обновиться", callback_data="system_update"),
         ],
         [
-            # Одна кнопка в ряду — растягивается на всю ширину
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="settings_close"),
+            InlineKeyboardButton(text="➖", callback_data="system_stub"),
+        ],
+        [
             InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main"),
         ]
     ])
@@ -89,6 +100,84 @@ async def cb_settings_back(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await cmd_settings(call.message)
 
+@router.callback_query(F.data == "system_stub")
+async def cb_system_stub(call: CallbackQuery):
+    """Заглушка — зарезервирована под будущие функции (например, нейросеть)"""
+    await call.answer("🚧 Эта кнопка в разработке")
+
+
+@router.callback_query(F.data == "system_update")
+async def cb_system_update(call: CallbackQuery):
+    """Обновление с GitHub: git pull + перезапуск. Все статусы — в одном сообщении."""
+    await call.answer()
+
+    async def show(text: str, keyboard: InlineKeyboardMarkup = None):
+        """Редактирует ТЕКУЩЕЕ сообщение; игнорирует 'message is not modified'"""
+        try:
+            await call.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
+
+    await show("⏳ Обновляюсь из репозитория...")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull", "--ff-only",
+            cwd=PROJECT_ROOT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        output = stdout.decode().strip()
+    except asyncio.TimeoutError:
+        proc.kill()
+        await show(
+            "❌ Таймаут обновления — GitHub не ответил. Попробуй позже.",
+            get_settings_keyboard(),
+        )
+        return
+    except Exception as e:
+        logger.exception("Ошибка обновления: %s", e)
+        await show(
+            f"❌ Не удалось запустить обновление:\n<code>{html.escape(str(e))}</code>",
+            get_settings_keyboard(),
+        )
+        return
+
+    if proc.returncode != 0:
+        await show(
+            f"❌ Ошибка обновления:\n<code>{html.escape(output[:1000])}</code>",
+            get_settings_keyboard(),
+        )
+        return
+
+    if "Already up to date" in output:
+        await show("✅ Уже актуально — обновлений нет.", get_settings_keyboard())
+        return
+
+    await show("✅ Обновилась! Перезапускаюсь... 🔄")
+    asyncio.create_task(
+        _restart_bot(call.message.chat.id, call.message.message_id)
+    )
+
+
+# Файл-маркер: говорит новому процессу, какое сообщение отредактировать вместо приветствия
+RESTART_MARKER = PROJECT_ROOT / "restart_marker.json"
+
+
+async def _restart_bot(chat_id: int, message_id: int):
+    """Перезапуск: даём сообщению долететь, оставляем маркер, заменяем процесс"""
+    await asyncio.sleep(2)
+    try:
+        RESTART_MARKER.write_text(
+            json.dumps({"chat_id": chat_id, "message_id": message_id}),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning("Не удалось записать маркер перезапуска: %s", e)
+    logger.info("Перезапуск бота после обновления (os.execv)")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 @router.callback_query(F.data == "settings_digesttime")
 async def cb_settings_digesttime(call: CallbackQuery, state: FSMContext):
