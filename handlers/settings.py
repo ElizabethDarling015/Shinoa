@@ -12,7 +12,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest
 
 from database.users import get_user, set_city, set_digest_time, upsert_user
 from handlers.common import parse_time, remove_keyboard

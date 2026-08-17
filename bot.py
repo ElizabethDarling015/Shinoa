@@ -8,12 +8,13 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -42,7 +43,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────────
+# Роутер для обработки кнопки «До завтра» на прощальном сообщении
+# ──────────────────────────────────────────────
+goodbye_router = Router(name="goodbye_router")
 
+
+@goodbye_router.callback_query(F.data == "goodbye_close")
+async def cb_goodbye_close(call: CallbackQuery):
+    """Кнопка 'До завтра 🌙' — удаляет прощальное сообщение."""
+    try:
+        await call.message.delete()
+    except TelegramBadRequest as e:
+        # Если прошло >48 часов — Telegram запрещает удаление, снимаем только клавиатуру
+        logger.warning("Не удалось удалить прощальное сообщение: %s", e)
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("Не удалось удалить прощальное сообщение: %s", e)
+    await call.answer()
+
+
+# ──────────────────────────────────────────────
+# Рассылка приветствия при старте
+# ──────────────────────────────────────────────
 async def send_startup_message(bot: Bot):
     """
     Отправляет приветственное сообщение при запуске бота.
@@ -87,6 +113,53 @@ async def send_startup_message(bot: Bot):
             )
 
 
+# ──────────────────────────────────────────────
+# Рассылка прощания при остановке
+# ──────────────────────────────────────────────
+async def send_goodbye_message(bot: Bot):
+    """
+    Отправляет уведомление об остановке всем ALLOWED_USERS.
+    Вызывается в finally при остановке polling'а.
+    """
+    text = "Я ушла. До завтра 🌙"
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="До завтра 🌙",
+                    callback_data="goodbye_close"
+                )
+            ]
+        ]
+    )
+
+    for chat_id in ALLOWED_USERS:
+        try:
+            await bot.send_message(
+                chat_id,
+                text,
+                reply_markup=keyboard,
+            )
+            logger.info(f"Прощальное сообщение отправлено пользователю {chat_id}")
+        except TelegramForbiddenError:
+            logger.warning(
+                f"Пользователь {chat_id} заблокировал бота или ещё не нажал /start"
+            )
+        except TelegramBadRequest as e:
+            if "chat not found" in str(e).lower():
+                logger.warning(
+                    f"Chat not found для {chat_id}. "
+                    f"Возможно, пользователь ещё не запускал бота или указан неверный ID."
+                )
+            else:
+                logger.warning(f"TelegramBadRequest для {chat_id}: {e}")
+        except Exception as e:
+            logger.warning(
+                f"Не удалось отправить прощальное сообщение пользователю {chat_id}: {e}"
+            )
+
+
 async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -97,6 +170,7 @@ async def main():
     dp.update.middleware(AccessMiddleware())
 
     dp.include_router(main_router)
+    dp.include_router(goodbye_router)   # ← роутер для кнопки прощания
 
     # ──────────────────────────────────────────
     # Регистрация команд меню (выполняется при старте)
@@ -175,6 +249,14 @@ async def main():
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        # ──────────────────────────────────────────
+        # Прощание при остановке (ДО закрытия сессии!)
+        # ──────────────────────────────────────────
+        try:
+            await send_goodbye_message(bot)
+        except Exception as e:
+            logger.error(f"Ошибка прощальной рассылки: {e}")
+
         await scheduler.stop()
         await bot.session.close()
         logger.info("Бот остановлен")
