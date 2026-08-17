@@ -12,6 +12,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.exceptions import TelegramBadRequest
 
 from database.users import get_user, set_city, set_digest_time, upsert_user
 from handlers.common import parse_time, remove_keyboard
@@ -33,7 +34,7 @@ class SetTimezone(StatesGroup):
 
 
 def get_settings_keyboard() -> InlineKeyboardMarkup:
-    """Главная клавиатура настроек — 4 кнопки"""
+    """Главная клавиатура настроек"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🌅 Изменить время сводки", callback_data="settings_digesttime"),
@@ -41,19 +42,43 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🪐 Установить UTC", callback_data="settings_settimezone"),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="settings_close"),
+        ],
+        [
+            # Одна кнопка в ряду — растягивается на всю ширину
             InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main"),
         ]
     ])
 
 
 def get_settings_nav_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура навигации внутри шагов FSM настроек — 2 кнопки"""
+    """Клавиатура навигации внутри шагов FSM настроек"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⬅️ Назад в настройки", callback_data="settings_back"),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="settings_close"),
+        ],
+        [
+            # Одна кнопка в ряду — растягивается на всю ширину
             InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main"),
         ]
     ])
+
+
+@router.callback_query(F.data == "settings_close")
+async def cb_settings_close(call: CallbackQuery):
+    """Удаляет текущее сообщение настроек"""
+    try:
+        await call.message.delete()
+    except TelegramBadRequest as e:
+        # Сообщение старше 48 часов — Telegram запрещает удаление
+        logger.warning("Не удалось удалить сообщение: %s", e)
+        try:
+            # Фолбэк: снимаем клавиатуру, чтобы кнопки не висели на старом сообщении
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await call.answer()
 
 
 @router.callback_query(F.data == "settings_back")
