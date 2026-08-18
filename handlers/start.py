@@ -113,6 +113,9 @@ def get_list_categories_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="📋 Все задачи", callback_data="list_all"),
+                InlineKeyboardButton(text="🌅 Сегодняшняя сводка", callback_data="digest_now"),
+            ],
+            [
                 InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
             ],
         ]
@@ -444,6 +447,55 @@ async def cmd_cancel_global(message: Message):
         reply_markup=get_start_keyboard(),
     )
 
+
+# ──────────────────────────────────────────────────────────
+# Кнопка «🌅 Сегодняшняя сводка» — собирает и показывает сводку вручную
+# ──────────────────────────────────────────────────────────
+
+def _get_digest_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура под сообщением сводки: Назад / На главную"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="start_list"),
+                InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
+            ]
+        ]
+    )
+
+
+@router.callback_query(F.data == "digest_now")
+async def cb_digest_now(call: CallbackQuery):
+    """Кнопка «🌅 Сегодняшняя сводка» — собирает сводку и показывает В ТОМ ЖЕ сообщении."""
+    await call.answer()
+
+    async def show(text: str, keyboard: InlineKeyboardMarkup = None):
+        """Редактирует текущее сообщение; если нельзя — шлёт новое"""
+        try:
+            await call.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+            await call.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+    # Пока собирается погода/задачи — в том же сообщении показываем статус
+    await show("⏳ Собираю сводку...")
+
+    try:
+        from database.users import get_user
+        from scheduler.digest import build_digest_text
+
+        user = await get_user(call.message.chat.id)
+        city = user["city"] if user and user.get("city") else None
+
+        text = await build_digest_text(call.message.chat.id, city=city)
+        await show(text, _get_digest_keyboard())
+    except Exception as e:
+        logger.exception("Ошибка при сборке сводки: %s", e)
+        await show(
+            "⚠️ Не удалось собрать сводку. Попробуй позже.",
+            _get_digest_keyboard(),
+        )
 
 def register_start(dp):
     dp.include_router(router)

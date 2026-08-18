@@ -23,8 +23,11 @@ PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 WEEKDAY_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 
-async def send_digest(bot: Bot, chat_id: int, city: str = None):
-    """Собирает и отправляет утреннюю сводку для одного пользователя."""
+async def build_digest_text(chat_id: int, city: str = None) -> str:
+    """
+    Собирает текст утренней сводки. Используется и планировщиком,
+    и кнопкой «🌅 Сегодняшняя сводка» в меню списка задач.
+    """
     from database.tasks import get_tasks
     from database.habits import get_habits, is_done_today
 
@@ -53,7 +56,7 @@ async def send_digest(bot: Bot, chat_id: int, city: str = None):
     tasks = await get_tasks(chat_id)
     if tasks:
         lines.append("\n<b>📋 Задачи:</b>")
-        for task in tasks[:10]:  # не больше 10 чтобы не перегружать
+        for task in tasks[:10]:
             p = PRIORITY_EMOJI.get(task["priority"], "🟡")
             lines.append(f"  {p} {task['title']}")
         if len(tasks) > 10:
@@ -76,7 +79,12 @@ async def send_digest(bot: Bot, chat_id: int, city: str = None):
     # ── Подсказка
     lines.append("\n<i>Хорошего дня! 🚀</i>")
 
-    text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+async def send_digest(bot: Bot, chat_id: int, city: str = None):
+    """Собирает и отправляет утреннюю сводку для одного пользователя."""
+    text = await build_digest_text(chat_id, city)
 
     try:
         await bot.send_message(chat_id, text, parse_mode="HTML")
