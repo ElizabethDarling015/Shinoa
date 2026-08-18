@@ -222,37 +222,41 @@ async def main():
 
     logger.info("Бот запущен ✅")
 
-    # ──────────────────────────────────────────
-    # Приветствие при запуске бота ИЛИ продолжение сообщения после update-перезапуска
-    # ──────────────────────────────────────────
     try:
-        marker_path = Path(__file__).resolve().parent / "restart_marker.json"
-        if marker_path.exists():
-            try:
-                data = json.loads(marker_path.read_text(encoding="utf-8"))
-                await bot.edit_message_text(
-                    STARTUP_TEXT,
-                    chat_id=data["chat_id"],
-                    message_id=data["message_id"],
-                    reply_markup=STARTUP_KEYBOARD,
-                )
-                logger.info("Перезапуск после обновления: сообщение отредактировано на месте")
-            except Exception as e:
-                logger.warning("Не удалось отредактировать сообщение после обновления: %s", e)
+        # ──────────────────────────────────────────
+        # Приветствие при старте ИЛИ продолжение сообщения после update-перезапуска
+        # ──────────────────────────────────────────
+        try:
+            marker_path = Path(__file__).resolve().parent / "restart_marker.json"
+            if marker_path.exists():
+                try:
+                    data = json.loads(marker_path.read_text(encoding="utf-8"))
+                    await bot.edit_message_text(
+                        STARTUP_TEXT,
+                        chat_id=data["chat_id"],
+                        message_id=data["message_id"],
+                        reply_markup=STARTUP_KEYBOARD,
+                    )
+                    logger.info("Перезапуск после обновления: сообщение отредактировано на месте")
+                except Exception as e:
+                    logger.warning("Не удалось отредактировать сообщение после обновления: %s", e)
+                    await send_startup_message(bot)
+                finally:
+                    marker_path.unlink(missing_ok=True)
+            else:
                 await send_startup_message(bot)
-            finally:
-                marker_path.unlink(missing_ok=True)
-        else:
-            await send_startup_message(bot)
-    except Exception as e:
-        logger.error(f"Ошибка стартовой рассылки: {e}")
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise  # Ctrl+C — уходим во внешний finally
+        except Exception as e:
+            logger.error(f"Ошибка стартовой рассылки: {e}")
 
-    try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Получен сигнал остановки — завершаюсь корректно")
+    except Exception as e:
+        logger.exception("Критическая ошибка в main(): %s", e)
     finally:
-        # ──────────────────────────────────────────
-        # Прощание при остановке (ДО закрытия сессии!)
-        # ──────────────────────────────────────────
+        # Прощание и очистка — ТЕПЕРЬ при любой остановке, в любой фазе
         try:
             await send_goodbye_message(bot)
         except Exception as e:
@@ -264,4 +268,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Ctrl+C уже обработан внутри main — здесь просто гасим traceback
+        pass
