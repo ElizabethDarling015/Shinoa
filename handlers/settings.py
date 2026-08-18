@@ -168,12 +168,21 @@ async def cb_system_update(call: CallbackQuery):
 RESTART_MARKER = PROJECT_ROOT / "restart_marker.json"
 
 
-async def _restart_bot():
-    """Перезапуск бота: через systemctl, если запущен как сервис, иначе os.execv"""
+async def _restart_bot(chat_id: int, message_id: int):
+    """Перезапуск бота: маркер + systemctl (если сервис), иначе os.execv"""
     import shutil
     await asyncio.sleep(2)
 
-    # Пытаемся перезапустить через systemd (если сервис существует)
+    # Маркер, чтобы новый процесс отредактировал это же сообщение
+    try:
+        RESTART_MARKER.write_text(
+            json.dumps({"chat_id": chat_id, "message_id": message_id}),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning("Не удалось записать маркер перезапуска: %s", e)
+
+    # Пытаемся перезапустить через systemd
     if shutil.which("systemctl"):
         proc = await asyncio.create_subprocess_exec(
             "sudo", "systemctl", "restart", "shinoa.service",
@@ -185,7 +194,7 @@ async def _restart_bot():
             logger.info("Перезапуск через systemctl shinoa.service выполнен")
             return
 
-    # Фолбэк: ручной запуск — заменяем процесс на себя
+    # Фолбэк: заменяем процесс на себя (работает и под systemd — PID тот же)
     logger.info("Перезапуск через os.execv (фолбэк)")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
