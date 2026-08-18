@@ -122,8 +122,10 @@ async def cb_system_update(call: CallbackQuery):
     await show("⏳ Обновляюсь из репозитория...")
 
     try:
+        import shutil
+        git_bin = shutil.which("git") or "/usr/bin/git"
         proc = await asyncio.create_subprocess_exec(
-            "git", "pull", "--ff-only",
+            git_bin, "pull", "--ff-only",
             cwd=PROJECT_ROOT,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -166,17 +168,25 @@ async def cb_system_update(call: CallbackQuery):
 RESTART_MARKER = PROJECT_ROOT / "restart_marker.json"
 
 
-async def _restart_bot(chat_id: int, message_id: int):
-    """Перезапуск: даём сообщению долететь, оставляем маркер, заменяем процесс"""
+async def _restart_bot():
+    """Перезапуск бота: через systemctl, если запущен как сервис, иначе os.execv"""
+    import shutil
     await asyncio.sleep(2)
-    try:
-        RESTART_MARKER.write_text(
-            json.dumps({"chat_id": chat_id, "message_id": message_id}),
-            encoding="utf-8",
+
+    # Пытаемся перезапустить через systemd (если сервис существует)
+    if shutil.which("systemctl"):
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "systemctl", "restart", "shinoa.service",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
-    except Exception as e:
-        logger.warning("Не удалось записать маркер перезапуска: %s", e)
-    logger.info("Перезапуск бота после обновления (os.execv)")
+        await proc.communicate()
+        if proc.returncode == 0:
+            logger.info("Перезапуск через systemctl shinoa.service выполнен")
+            return
+
+    # Фолбэк: ручной запуск — заменяем процесс на себя
+    logger.info("Перезапуск через os.execv (фолбэк)")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 @router.callback_query(F.data == "settings_digesttime")
