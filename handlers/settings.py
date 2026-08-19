@@ -94,11 +94,19 @@ async def cb_settings_close(call: CallbackQuery):
 
 @router.callback_query(F.data == "settings_back")
 async def cb_settings_back(call: CallbackQuery, state: FSMContext):
-    """Возврат в меню настроек из FSM"""
+    """Возврат в меню настроек из FSM — редактирует ТЕКУЩЕЕ сообщение"""
     await state.clear()
-    from handlers.settings import cmd_settings
     await call.answer()
-    await cmd_settings(call.message)
+
+    try:
+        await call.message.edit_text(
+            await _settings_text(call.message.chat.id),
+            parse_mode="HTML",
+            reply_markup=get_settings_keyboard(),
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 @router.callback_query(F.data == "system_stub")
 async def cb_system_stub(call: CallbackQuery):
@@ -265,13 +273,30 @@ async def step_timezone(message: Message, state: FSMContext):
         )
 
 
-@router.message(Command("settings"))
-async def cmd_settings(message: Message):
-    user = await get_user(message.chat.id)
+async def _settings_text(chat_id: int) -> str:
+    """Собирает текст экрана настроек (для команды и для редактирования)"""
+    user = await get_user(chat_id)
 
     city = user["city"] if user and user.get("city") else "не задан"
     digest_time = user["digest_time"] if user else "07:00"
     tz = user["timezone"] if user else "Europe/Moscow"
+
+    return (
+        "<b>⚙️ Настройки</b>\n\n"
+        f"🌆 Город для погоды: <b>{city}</b>\n"
+        f"🌅 Время утренней сводки: <b>{digest_time}</b>\n"
+        f"🕐 Часовой пояс: <b>{tz}</b>\n\n"
+        "<i>Используй кнопки ниже для изменения настроек.</i>"
+    )
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message):
+    await message.answer(
+        await _settings_text(message.chat.id),
+        parse_mode="HTML",
+        reply_markup=get_settings_keyboard(),
+    )
 
     await message.answer(
         "<b>⚙️ Настройки</b>\n\n"

@@ -3,9 +3,10 @@
 
 Содержимое:
   ☀️ Погода (если настроен город)
-  🔴 Просроченные задачи
   📋 Задачи на сегодня (по приоритету)
   💪 Привычки на сегодня
+
+Сводка закрепляется в чате; при следующей сводке предыдущая открепляется.
 """
 
 import logging
@@ -16,6 +17,7 @@ from aiogram import Bot
 
 from config import DEFAULT_TIMEZONE, WEATHER_API_KEY
 from services.weather import get_weather
+from database.connection import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -82,15 +84,68 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     return "\n".join(lines)
 
 
+# ──────────────────────────────────────────────
+# Хранение ID последней закреплённой сводки
+# ──────────────────────────────────────────────
+
+async def _get_last_digest_pin(chat_id: int) -> int | None:
+    """ID сообщения последней закреплённой сводки (или None)."""
+    try:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT last_digest_msg_id FROM users WHERE chat_id = ?",
+                (chat_id,),
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else None
+    except Exception as e:
+        logger.warning("Не удалось прочитать ID старого пина: %s", e)
+        return None
+
+
+async def _set_last_digest_pin(chat_id: int, message_id: int):
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE users SET last_digest_msg_id = ? WHERE chat_id = ?",
+            (message_id, chat_id),
+        )
+        await db.commit()
+
+
+# ──────────────────────────────────────────────
+# Отправка
+# ──────────────────────────────────────────────
+
 async def send_digest(bot: Bot, chat_id: int, city: str = None):
-    """Собирает и отправляет утреннюю сводку для одного пользователя."""
+    """Собирает и отправляет утреннюю сводку, закрепляя её (старая открепляется)."""
     text = await build_digest_text(chat_id, city)
 
     try:
-        await bot.send_message(chat_id, text, parse_mode="HTML")
+        msg = await bot.send_message(chat_id, text, parse_mode="HTML")
         logger.info("Утренняя сводка отправлена → чат %s", chat_id)
     except Exception as e:
         logger.error("Ошибка отправки сводки → чат %s: %s", chat_id, e)
+        return
+
+    # ── Закрепление: открепляем прошлую, закрепляем новую
+    try:
+        old_id = await _get_last_digest_pin(chat_id)
+        if old_id:
+            try:
+                await bot.unpin_chat_message(chat_id=chat_id, message_id=old_id)
+            except Exception as e:
+                logger.warning("Не удалось открепить старую сводку: %s", e)
+
+        await bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            disable_notification=True,  # без лишнего звука — сводка уже уведомление
+        )
+        await _set_last_digest_pin(chat_id, msg.message_id)
+        logger.info("Сводка закреплена → чат %s", chat_id)
+    except Exception as e:
+        # Пин — не критичен: сводка уже доставлена
+        logger.warning("Не удалось закрепить сводку: %s", e)
 
 
 async def send_all_digests(bot: Bot):

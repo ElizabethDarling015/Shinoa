@@ -18,6 +18,20 @@ class AccessMiddleware(BaseMiddleware):
         event: Update,
         data: Dict[str, Any]
     ) -> Any:
+        # Пропускаем служебные сообщения (pinned_message, new_chat_members и т.д.)
+        if event.message and (
+            event.message.pinned_message or
+            event.message.new_chat_members or
+            event.message.left_chat_member or
+            event.message.new_chat_title or
+            event.message.new_chat_photo or
+            event.message.delete_chat_photo or
+            event.message.group_chat_created or
+            event.message.supergroup_chat_created or
+            event.message.channel_chat_created
+        ):
+            return await handler(event, data)
+
         user_id = None
         if event.message:
             user_id = event.message.from_user.id

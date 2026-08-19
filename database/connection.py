@@ -63,6 +63,10 @@ async def run_migrations():
             sql = migration_file.read_text(encoding="utf-8")
             logger.info("Применяю миграцию %s...", migration_file.name)
             await db.executescript(sql)
+            await db.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (version,),
+            )
             await db.commit()
             logger.info("Миграция %d применена", version)
 
