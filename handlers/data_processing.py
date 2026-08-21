@@ -26,6 +26,10 @@ def get_data_processing_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📓 Obsidian", callback_data="data_obsidian"),
         ],
         [
+            InlineKeyboardButton(text="🌐 Мой IP", callback_data="data_myip"),
+            InlineKeyboardButton(text="➖", callback_data="data_stub"),
+        ],
+        [
             InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
         ]
     ])
@@ -150,3 +154,64 @@ async def cb_data_transcribe(call: CallbackQuery):
 async def cb_data_obsidian(call: CallbackQuery):
     """Заглушка для Obsidian"""
     await call.answer("🚧 Интеграция с Obsidian в разработке", show_alert=True)
+
+@router.callback_query(F.data == "data_stub")
+async def cb_data_stub(call: CallbackQuery):
+    """Заглушка для чётности"""
+    await call.answer("🚧 Эта кнопка в разработке")
+
+@router.callback_query(F.data == "data_myip")
+async def cb_data_myip(call: CallbackQuery):
+    """🌐 Мой IP: локальный VM, туннельный и домашний внешний (через хост)"""
+    import socket
+    import aiohttp
+    from urllib.parse import urlparse
+    from config import HOST_IP_URL
+
+    await call.answer()
+
+    def local_ip(route_to: str) -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((route_to, 1))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "н/д"
+
+    gateway = urlparse(HOST_IP_URL).hostname if HOST_IP_URL else None
+
+    lan = local_ip(gateway) if gateway else "н/д"
+    tun = local_ip("8.8.8.8")
+
+    wan = None
+    if HOST_IP_URL:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as session:
+                async with session.get(HOST_IP_URL) as resp:
+                    wan = (await resp.json()).get("wan")
+        except Exception as e:
+            logger.warning("Хост недоступен для запроса IP: %s", e)
+
+    lines = ["🌐 <b>Мой IP</b>", ""]
+    lines.append(f"🏠 Локальный (VM): <code>{lan}</code>")
+    if tun != lan:
+        lines.append(f"🕳️ Туннель (VPN): <code>{tun}</code>")
+    lines.append(
+        f"🌍 Домашний внешний: <code>{wan}</code>"
+        if wan else "🌍 Домашний внешний: <i>недоступен</i>"
+    )
+
+    nav = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="start_data"),
+            InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
+        ]
+    ])
+
+    try:
+        await call.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=nav)
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            await call.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=nav)

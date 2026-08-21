@@ -21,3 +21,4 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # Будет None, если ключа нет
 ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS = [int(x.strip()) for x in ALLOWED_USERS_STR.split(",") if x.strip()]
+HOST_IP_URL = os.getenv("HOST_IP_URL", "")
