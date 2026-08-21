@@ -69,10 +69,12 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     elif city:
         lines.append(f"\n🌡 <i>Погода недоступна — добавь WEATHER_API_KEY в config.py</i>")
         
-    # ── Домашний внешний IP (под прогнозом)
+    # ── Домашний внешний IP (под прогнозом) — выводится всегда
     home_ip = await get_home_ip()
     if home_ip:
         lines.append(f"\n🌍 <b>Домашний внешний IP:</b> <code>{home_ip}</code>")
+    else:
+        lines.append(f"\n🌍 <b>Домашний внешний IP:</b> <i>недоступен</i>")
 
     # ── Задачи на сегодня (по приоритету)
     tasks = await get_tasks(chat_id)

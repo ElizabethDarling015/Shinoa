@@ -89,22 +89,23 @@ async def get_weather(city: str, api_key: str) -> str | None:
             dt_obj = datetime.strptime(dt_txt, "%Y-%m-%d %H:%M:%S")
             today = datetime.now().date()
             
+            # Перевод дней недели на русский
+            weekdays_ru = {
+                "Monday": "Понедельник",
+                "Tuesday": "Вторник",
+                "Wednesday": "Среда",
+                "Thursday": "Четверг",
+                "Friday": "Пятница",
+                "Saturday": "Суббота",
+                "Sunday": "Воскресенье",
+            }
+            day_en = dt_obj.strftime("%A")
+
             if dt_obj.date() == today:
                 day_name = "📅 <b>Сегодня</b>"
             elif dt_obj.date() == today + timedelta(days=1):
-                day_name = "📅 <b>Завтра</b>"
+                day_name = f"📅 <b>Завтра ({weekdays_ru.get(day_en, day_en)})</b>"
             else:
-                # Перевод дней недели на русский
-                weekdays_ru = {
-                    "Monday": "Понедельник",
-                    "Tuesday": "Вторник",
-                    "Wednesday": "Среда",
-                    "Thursday": "Четверг",
-                    "Friday": "Пятница",
-                    "Saturday": "Суббота",
-                    "Sunday": "Воскресенье",
-                }
-                day_en = dt_obj.strftime("%A")
                 day_name = f"📅 <b>{weekdays_ru.get(day_en, day_en)}</b>"
 
             temp_day = round(item["main"]["temp"])
@@ -124,7 +125,6 @@ async def get_weather(city: str, api_key: str) -> str | None:
     full_report = (
         f"🌍 <b>Погода в городе: {city.capitalize()}</b>\n\n"
         f"{current_text}"
-        f"📆 <b>Прогноз:</b>\n"
         f"{forecast_text}"
     )
     
