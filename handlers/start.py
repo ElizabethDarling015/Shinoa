@@ -322,17 +322,6 @@ async def cb_start_list(call: CallbackQuery):
     )
 
 
-@router.callback_query(F.data.startswith("list_cat:"))
-async def cb_list_category(call: CallbackQuery):
-    await call.answer()
-
-    category = call.data.split(":")[1]
-
-    from handlers.list_tasks import send_task_list
-
-    await send_task_list(call.message, category=category)
-
-
 @router.callback_query(F.data == "list_all")
 async def cb_list_all(call: CallbackQuery):
     await call.answer()
