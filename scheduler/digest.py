@@ -15,7 +15,7 @@ from datetime import datetime, date
 import pytz
 from aiogram import Bot
 
-from config import DEFAULT_TIMEZONE, WEATHER_API_KEY
+from config import DEFAULT_TIMEZONE, WEATHER_API_KEY, HOST_IP_URL
 from services.weather import get_weather
 from database.connection import get_db
 
@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 WEEKDAY_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+async def get_home_ip() -> str | None:
+    """Запрашивает домашний внешний IP у сервера на хосте (ip_server)."""
+    import aiohttp
+    if not HOST_IP_URL:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(HOST_IP_URL) as resp:
+                return (await resp.json()).get("wan")
+    except Exception as e:
+        logger.warning("Не удалось получить домашний IP для сводки: %s", e)
+        return None
 
 
 async def build_digest_text(chat_id: int, city: str = None) -> str:
@@ -53,6 +68,11 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
             lines.append(f"\n{weather}")
     elif city:
         lines.append(f"\n🌡 <i>Погода недоступна — добавь WEATHER_API_KEY в config.py</i>")
+        
+    # ── Домашний внешний IP (под прогнозом)
+    home_ip = await get_home_ip()
+    if home_ip:
+        lines.append(f"\n🌍 <b>Домашний внешний IP:</b> <code>{home_ip}</code>")
 
     # ── Задачи на сегодня (по приоритету)
     tasks = await get_tasks(chat_id)

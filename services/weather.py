@@ -123,7 +123,7 @@ async def get_weather(city: str, api_key: str) -> str | None:
     # --- Собираем итоговое сообщение ---
     full_report = (
         f"🌍 <b>Погода в городе: {city.capitalize()}</b>\n\n"
-        f"{current_text}\n"
+        f"{current_text}"
         f"📆 <b>Прогноз:</b>\n"
         f"{forecast_text}"
     )
