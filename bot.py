@@ -17,9 +17,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
+    BotCommandScopeChat,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MenuButtonCommands
 )
 
 from config import BOT_TOKEN, DEFAULT_TIMEZONE, ALLOWED_USERS
@@ -159,6 +161,7 @@ async def main():
     # ──────────────────────────────────────────
     # Регистрация команд меню (выполняется при старте)
     # ──────────────────────────────────────────
+
     @dp.startup()
     async def set_commands(bot: Bot):
         commands = [
@@ -180,15 +183,26 @@ async def main():
             BotCommand(command="settimezone", description="Часовой пояс"),
             BotCommand(command="digesttime", description="Время сводки"),
         ]
+        
+        # 1. Очищаем глобальные команды и глобальную кнопку меню
         try:
-            await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
-            logger.info("Команды бота обновлены ✅")
+            await bot.delete_my_commands(scope=BotCommandScopeDefault())
+            await bot.set_chat_menu_button(menu_button=MenuButtonCommands()) # Возвращаем глобальную кнопку как фоллбэк
+            logger.info("Глобальные настройки очищены и сброшены 🧹")
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось обновить команды бота (проблема с сетью): {e}")
-            logger.info(
-                "Бот продолжит работу. Команды можно обновить вручную через @BotFather "
-                "или перезапустить бота."
-            )
+            logger.warning(f"⚠️ Не удалось очистить глобальные настройки: {e}")
+
+        # 2. Устанавливаем команды и кнопку меню ТОЛЬКО для авторизованных пользователей
+        for user_id in ALLOWED_USERS:
+            try:
+                await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=user_id))
+                await bot.set_chat_menu_button(
+                    chat_id=user_id, 
+                    menu_button=MenuButtonCommands()
+                )
+                logger.info(f"Команды и кнопка 'Меню' установлены для пользователя {user_id} ✅")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось настроить пользователя {user_id}: {e}")
 
     # ──────────────────────────────────────────
     # Глобальный обработчик ошибок
@@ -250,7 +264,7 @@ async def main():
         except Exception as e:
             logger.error(f"Ошибка стартовой рассылки: {e}")
 
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await dp.start_polling(bot)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Получен сигнал остановки — завершаюсь корректно")
     except Exception as e:
