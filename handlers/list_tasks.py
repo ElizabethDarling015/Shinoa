@@ -1,5 +1,6 @@
 """
-/list — список задач с фильтрами по категории и приоритету.
+/list — список задач с фильтрами по категории и приоритету (старый).
+/tasks — новое меню задач (Сегодня, Категории, Приоритет, Сводка).
 /delete <id> — удаление задачи.
 """
 
@@ -39,7 +40,7 @@ def get_list_nav_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура навигации для списка задач"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="start_list"),
+            InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="tasks_menu:categories"),
             InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
         ]
     ])
@@ -51,6 +52,114 @@ def get_close_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_message")]
     ])
 
+
+# ──────────────────────────────────────────────────────────
+# НОВОЕ МЕНЮ ЗАДАЧ
+# ──────────────────────────────────────────────────────────
+
+def get_tasks_main_keyboard() -> InlineKeyboardMarkup:
+    """Главное меню нового списка задач"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📅 Сегодня", callback_data="tasks_menu:today"),
+            InlineKeyboardButton(text="📂 Категории", callback_data="tasks_menu:categories")
+        ],
+        [
+            InlineKeyboardButton(text="🔴 Приоритет", callback_data="tasks_menu:priority"),
+            InlineKeyboardButton(text="📊 Сводка", callback_data="tasks_menu:summary")
+        ],
+        [
+            InlineKeyboardButton(text="🏠 На главную", callback_data="start_main")
+        ]
+    ])
+
+
+def get_task_categories_keyboard() -> InlineKeyboardMarkup:
+    """Старое меню выбора категорий для списка задач"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 Личное", callback_data="list_cat:личное"),
+            InlineKeyboardButton(text="💼 Работа", callback_data="list_cat:работа"),
+        ],
+        [
+            InlineKeyboardButton(text="💰 Финансы", callback_data="list_cat:финансы"),
+            InlineKeyboardButton(text="❤️ Здоровье", callback_data="list_cat:здоровье"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад в меню задач", callback_data="tasks_menu:main")],
+    ])
+
+
+@router.callback_query(F.data == "tasks_menu:main")
+async def cb_tasks_main(call: CallbackQuery):
+    """Возврат в главное меню задач (РЕДАКТИРУЕТ сообщение)"""
+    await call.answer()
+    try:
+        await call.message.edit_text(
+            "📋 <b>Меню задач</b>\n\nВыберите удобный способ просмотра:",
+            parse_mode="HTML",
+            reply_markup=get_tasks_main_keyboard()
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
+@router.callback_query(F.data == "tasks_menu:today")
+async def cb_tasks_today(call: CallbackQuery):
+    """Показывает только утренние задачи на сегодня (РЕДАКТИРУЕТ сообщение)"""
+    await call.answer()
+    tasks = await db.get_tasks(call.message.chat.id, task_type="morning")
+    
+    if not tasks:
+        text = "📅 На сегодня утренних задач нет. Отличный повод отдохнуть или добавить новую! ☕"
+    else:
+        parts = ["📅 <b>Сегодняшние утренние задачи:</b>\n"]
+        for task in tasks:
+            parts.append(await format_task(task))
+        text = "\n\n".join(parts)
+        text += "\n\n<i>Удалить:</i> <code>/delete</code> <i>&lt;id&gt;</i>"
+
+    try:
+        await call.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⬅️ Назад в задачи", callback_data="tasks_menu:main"),
+                    InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main")
+                ]
+            ])
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
+@router.callback_query(F.data == "tasks_menu:categories")
+async def cb_tasks_categories(call: CallbackQuery):
+    """Открывает меню категорий (РЕДАКТИРУЕТ сообщение)"""
+    await call.answer()
+    try:
+        await call.message.edit_text(
+            "📋 <b>Вот наши списки задач🎁:</b>\n\nКакую категорию рассмотрим?😌",
+            parse_mode="HTML",
+            reply_markup=get_task_categories_keyboard()
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
+@router.callback_query(F.data == "tasks_menu:priority")
+async def cb_tasks_priority(call: CallbackQuery):
+    """Показывает все задачи по приоритетам (ОТПРАВЛЯЕТ новые сообщения с кнопкой 'Закрыть')"""
+    await call.answer()
+    await send_task_list(call.message, exclude_type="morning", use_close_keyboard=True)
+
+
+# ──────────────────────────────────────────────────────────
+# СТАРАЯ ЛОГИКА (сохранена без изменений)
+# ──────────────────────────────────────────────────────────
 
 async def format_task(task: dict) -> str:
     schedules = await db.get_schedules(task["id"])
@@ -81,10 +190,6 @@ async def format_task(task: dict) -> str:
     )
 
 
-# ──────────────────────────────────────────────────────────
-# Обработчик выбора категории (РЕДАКТИРУЕТ сообщение)
-# ──────────────────────────────────────────────────────────
-
 @router.callback_query(F.data.startswith("list_cat:"))
 async def cb_list_category(call: CallbackQuery):
     """Показывает задачи конкретной категории, РЕДАКТИРУЯ текущее сообщение"""
@@ -104,7 +209,6 @@ async def cb_list_category(call: CallbackQuery):
                 raise
         return
 
-    # Разделяем задачи по приоритетам для красивого вывода
     tasks_by_priority = {"high": [], "medium": [], "low": []}
     for task in tasks:
         p = task.get("priority", "medium")
@@ -127,7 +231,7 @@ async def cb_list_category(call: CallbackQuery):
             parts.append(await format_task(task))
 
     text = f"📋 <b>Задачи: {category.capitalize()}</b>\n\n" + "\n\n".join(parts)
-    text += "\n\n<i>Удалить: /delete &lt;id&gt;</i>"
+    text += "\n\n<i>Удалить:</i> <code>/delete</code> <i>&lt;id&gt;</i>"
 
     try:
         await call.message.edit_text(
@@ -138,13 +242,8 @@ async def cb_list_category(call: CallbackQuery):
             raise
 
 
-# ──────────────────────────────────────────────────────────
-# Отправка нового сообщения (для /list и кнопки "Все задачи")
-# ──────────────────────────────────────────────────────────
-
 async def send_task_list(message: Message, category: str = None, priority: str = None, exclude_type: str = None, use_close_keyboard: bool = False):
     """Основная логика показа списка задач — разбивка по приоритетам (Тир-1/2/3)"""
-    # Передаем exclude_type в базу данных
     tasks = await db.get_tasks(message.chat.id, category=category, priority=priority, exclude_type=exclude_type)
 
     if not tasks:
@@ -156,52 +255,41 @@ async def send_task_list(message: Message, category: str = None, priority: str =
             "/monthly — ежемесячное\n"
             "/daily — ежедневное\n"
             "/morning — задача на завтра",
-            reply_markup=get_list_nav_keyboard()
+            reply_markup=get_close_keyboard() if use_close_keyboard else get_list_nav_keyboard()
         )
         return
 
-    # Разделяем задачи по приоритетам
-    tasks_by_priority = {
-        "high": [],
-        "medium": [],
-        "low": [],
-    }
+    tasks_by_priority = {"high": [], "medium": [], "low": []}
     for task in tasks:
         p = task.get("priority", "medium")
         if p in tasks_by_priority:
             tasks_by_priority[p].append(task)
 
-    # Заголовки для каждого тира
     tier_headers = {
         "high": "🔴 Тир-1 (Срочно)",
         "medium": "🟡 Тир-2 (Средне)",
         "low": "🟢 Тир-3 (Когда-нибудь)",
     }
 
-    # Отправляем по одному сообщению на каждый заполненный тир
     for tier_key, tier_tasks in tasks_by_priority.items():
         if not tier_tasks:
-            continue  # Пропускаем пустые тиры
+            continue
 
-        parts = []
-        for task in tier_tasks:
-            parts.append(await format_task(task))
-
-        # Заголовок сообщения
+        parts = [await format_task(task) for task in tier_tasks]
         header = f"<b>{tier_headers[tier_key]}</b>"
         if category:
             header += f" · {category.capitalize()}"
         header += f"\n\n<i>Всего: {len(tier_tasks)}</i>"
 
         text = header + "\n\n" + "\n\n".join(parts)
-        text += "\n\n<i>Удалить: /delete &lt;id&gt;</i>"
+        text += "\n\n<i>Удалить:</i> <code>/delete</code> <i>&lt;id&gt;</i>"
 
         keyboard = get_close_keyboard() if use_close_keyboard else get_list_nav_keyboard()
         await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
+
 @router.message(Command("list"))
 async def cmd_list(message: Message):
-    # Парсим фильтры из аргументов: /list работа или /list high
     args = message.text.split()[1:] if len(message.text.split()) > 1 else []
     category = None
     priority = None
@@ -239,15 +327,10 @@ async def cmd_delete(message: Message, command: CommandObject):
     await message.answer(f"🗑 Задача <b>{task['title']}</b> удалена.", parse_mode="HTML")
 
 
-# ──────────────────────────────────────────────────────────
-# Обработчик кнопки "Все задачи" (теперь исключает morning)
-# ──────────────────────────────────────────────────────────
-
 @router.callback_query(F.data == "list_all")
 async def cb_list_all(call: CallbackQuery):
     """Показывает ВСЕ задачи, КРОМЕ утренних (morning)"""
     await call.answer()
-    # Передаем exclude_type="morning", чтобы утренние планы не попадали в этот список
     await send_task_list(call.message, exclude_type="morning", use_close_keyboard=True)
 
 

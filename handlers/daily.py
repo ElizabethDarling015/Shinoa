@@ -196,32 +196,52 @@ def get_morning_time_keyboard() -> InlineKeyboardMarkup:
 @router.message(Command("morning"))
 async def cmd_morning(message: Message, state: FSMContext):
     await state.set_state(NewMorning.text)
-    await message.answer(
+    
+    # Отправляем сообщение и СРАЗУ сохраняем его ID для будущего редактирования
+    bot_msg = await message.answer(
         "🌅 <b>Задача на завтра утром</b>\n\n"
         "Напишу тебе завтра в нужное время и задача исчезнет.\n\n"
         "Что нужно сделать?",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()]),
     )
+    await state.update_data(bot_msg_id=bot_msg.message_id)
 
 
 @router.message(NewMorning.text)
 async def morning_text(message: Message, state: FSMContext):
-    if message.text.strip() == "❌ Отмена":
+    if message.text.strip() in ("❌ Отмена", "Отмена", "cancel"):
         await _cancel(message, state)
         return
+    
     await state.update_data(text=message.text.strip())
     await state.set_state(NewMorning.time)
     
-    # Отправляем вопрос о времени и сохраняем его message_id для редактирования
-    bot_msg = await message.answer(
+    data = await state.get_data()
+    bot_msg_id = data.get("bot_msg_id")
+    
+    question_text = (
         "В какое время завтра напомнить?\n\n"
         "Вы можете ввести время вручную (например, <code>08:30</code>)\n"
-        "или нажать кнопку «Стандартное» ниже.",
-        parse_mode="HTML",
-        reply_markup=get_morning_time_keyboard(),
+        "или нажать кнопку «Стандартное» ниже."
     )
-    await state.update_data(bot_msg_id=bot_msg.message_id)
+    
+    # Пытаемся отредактировать первое сообщение
+    if bot_msg_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=bot_msg_id,
+                text=question_text,
+                parse_mode="HTML",
+                reply_markup=get_morning_time_keyboard(),
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отредактировать сообщение: {e}")
+            # Если редактирование не вышло, отправляем новое (страховка)
+            await message.answer(question_text, parse_mode="HTML", reply_markup=get_morning_time_keyboard())
+    else:
+        await message.answer(question_text, parse_mode="HTML", reply_markup=get_morning_time_keyboard())
 
 
 @router.message(NewMorning.time)
@@ -260,26 +280,37 @@ async def morning_time(message: Message, state: FSMContext):
         )
 
 
-@router.callback_query(F.data == "morning_time:10:00")
+@router.callback_query(F.data=="morning_time:10:00")
 async def cb_morning_time_standard(call: CallbackQuery, state: FSMContext):
     """Обработчик нажатия на кнопку 'Стандартное (10:00)'"""
     await call.answer()
-    
     time_str = "10:00"
     await state.update_data(time=time_str)
     
-    # Получаем message_id предыдущего сообщения бота
     data = await state.get_data()
     bot_msg_id = data.get("bot_msg_id")
-    
     await state.set_state(NewMorning.priority)
     
-    # Редактируем сообщение бота, переходя к выбору приоритета
     if bot_msg_id:
-        await call.message.bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=bot_msg_id,
-            text="Выберите <b>приоритет</b> напоминания:",
+        try:
+            await call.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=bot_msg_id,
+                text="Выберите <b>приоритет</b> напоминания:",
+                parse_mode="HTML",
+                reply_markup=get_morning_priority_keyboard()
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отредактировать сообщение: {e}")
+            # Страховка: если редактирование не прошло, отправляем новое сообщение с кнопками
+            await call.message.answer(
+                "Выберите <b>приоритет</b> напоминания:",
+                parse_mode="HTML",
+                reply_markup=get_morning_priority_keyboard()
+            )
+    else:
+        await call.message.answer(
+            "Выберите <b>приоритет</b> напоминания:",
             parse_mode="HTML",
             reply_markup=get_morning_priority_keyboard()
         )

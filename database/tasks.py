@@ -39,14 +39,18 @@ async def get_task(task_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-async def get_tasks(chat_id: int, category: str = None, priority: str = None, exclude_type: str = None) -> list[dict]:
+async def get_tasks(chat_id: int, category: str = None, priority: str = None, exclude_type: str = None, task_type: str = None) -> list[dict]:
     query = "SELECT * FROM tasks WHERE chat_id = ? AND status = 'active'"
     params = [chat_id]
 
-    # Исключаем определенный тип задач (например, "morning")
     if exclude_type:
         query += " AND type != ?"
         params.append(exclude_type)
+    
+    # НОВОЕ: Фильтрация по конкретному типу задачи
+    if task_type:
+        query += " AND type = ?"
+        params.append(task_type)
 
     if category:
         query += " AND category = ?"
@@ -56,11 +60,11 @@ async def get_tasks(chat_id: int, category: str = None, priority: str = None, ex
         params.append(priority)
 
     query += " ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, id"
-
+    
     async with get_db() as db:
         async with db.execute(query, params) as cur:
             rows = await cur.fetchall()
-    return [dict(r) for r in rows]
+            return [dict(r) for r in rows]
 
 
 async def complete_task(task_id: int, chat_id: int) -> bool:

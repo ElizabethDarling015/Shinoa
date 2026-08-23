@@ -30,13 +30,13 @@ MAIN_MENU_TEXT = (
 HELP_TEXT = (
     "<b>📖 Полная справка</b>\n\n"
     "<b>Типы задач:</b>\n"
-    "• /week — еженедельное напоминание (по дням недели)\n"
-    "• /daily — каждый день в одно время\n"
-    "• /morning — один раз, завтра утром, потом удаляется\n"
-    "• /monthly — каждый месяц в определённое число или раз в год\n\n"
+    "• /week — Еженедельное напоминание (по дням недели)\n"
+    "• /daily — Каждый день в одно время\n"
+    "• /morning — Один раз, завтра утром, потом удаляется\n"
+    "• /monthly — Каждый месяц в определённое число или раз в год\n\n"
     "<b>Фильтры /list:</b>\n"
-    "• /list работа — только задачи категории «работа»\n"
-    "• /list high — только срочные\n\n"
+    "• /list работа — Только задачи категории «работа»\n"
+    "• /list high — Только срочные\n\n"
     "<b>Категории задач:</b>\n"
     "Работа · Личное · Финансы · Здоровье\n\n"
     "<b>Приоритеты:</b>\n"
@@ -51,12 +51,12 @@ HELP_TEXT = (
     "• /find #тег или /find запрос — поиск\n\n"
     "<b>Привычки:</b>\n"
     "Каждый вечер напомню отметить привычку.\n"
-    "Streak 🔥 показывает сколько дней подряд не пропускал.\n\n"
+    "Streak 🔥 Показывает сколько дней подряд не пропускал.\n\n"
     "<b>Утренняя сводка:</b>\n"
     "Каждое утро пришлю план дня, задачи и погоду.\n"
-    "• /setcity — установить город для погоды\n"
-    "• /digesttime — изменить время сводки (по умолчанию 07:00)\n"
-    "• /settings — все настройки"
+    "• /setcity — Установить город для погоды\n"
+    "• /digesttime — Изменить время сводки (по умолчанию 07:00)\n"
+    "• /settings — Все настройки"
 )
 
 
@@ -99,8 +99,24 @@ def get_new_task_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def get_list_categories_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора категории для списка задач."""
+def get_tasks_main_keyboard() -> InlineKeyboardMarkup:
+    """Главное меню нового списка задач"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📅 Сегодня", callback_data="tasks_menu:today"),
+            InlineKeyboardButton(text="📂 По категории", callback_data="tasks_menu:categories")
+        ],
+        [
+            InlineKeyboardButton(text="🔴 По приоритету", callback_data="tasks_menu:priority"),
+            InlineKeyboardButton(text="🌅 Сегодняшняя сводка", callback_data="digest_now")
+        ],
+        [
+            InlineKeyboardButton(text="🏠 На главную", callback_data="start_main")
+        ]
+    ])
+
+def get_task_categories_keyboard() -> InlineKeyboardMarkup:
+    """Старое меню выбора категорий для списка задач."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -112,11 +128,7 @@ def get_list_categories_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="❤️ Здоровье", callback_data="list_cat:здоровье"),
             ],
             [
-                InlineKeyboardButton(text="📋 Все задачи", callback_data="list_all"),
-                InlineKeyboardButton(text="🌅 Сегодняшняя сводка", callback_data="digest_now"),
-            ],
-            [
-                InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
+                InlineKeyboardButton(text="⬅️ Назад в меню задач", callback_data="start_list"),
             ],
         ]
     )
@@ -309,27 +321,23 @@ async def cb_task_month(call: CallbackQuery, state: FSMContext):
 # ──────────────────────────────────────────────────────────
 
 
-@router.callback_query(F.data == "start_list")
+@router.callback_query(F.data=="start_list")
 async def cb_start_list(call: CallbackQuery):
     await call.answer()
-
-    text = "📋 <b>Вот наш список задач🎁:</b>\n\nКакую категорию рассмотрим?😌"
-
+    text = "💼 <b>Меню задач</b>\n\nЧто смотреть будем?☺️"
     await _safe_edit(
         call.message,
         text,
-        get_list_categories_keyboard(),
+        get_tasks_main_keyboard(),
     )
 
 
-@router.callback_query(F.data == "list_all")
+@router.callback_query(F.data=="list_all")
 async def cb_list_all(call: CallbackQuery):
     await call.answer()
-
     from handlers.list_tasks import send_task_list
-
-    # Утренние задачи исключаем из общего списка
-    await send_task_list(call.message, exclude_type="morning")
+    # Утренние задачи исключаем из общего списка, показываем кнопку "Закрыть"
+    await send_task_list(call.message, exclude_type="morning", show_close_button=True)
 
 
 @router.callback_query(F.data == "start_settings")
@@ -380,6 +388,48 @@ async def cb_start_idea(call: CallbackQuery, state: FSMContext):
     )
 
 
+@router.callback_query(F.data=="tasks_categories")
+async def cb_tasks_categories(call: CallbackQuery):
+    """Открывает старое меню категорий"""
+    await call.answer()
+    await _safe_edit(
+        call.message,
+        "📂 <b>Выберите категорию:</b>",
+        get_task_categories_keyboard(),
+    )
+
+@router.callback_query(F.data=="tasks_today")
+async def cb_tasks_today(call: CallbackQuery):
+    """Показывает только утренние задачи на сегодня"""
+    await call.answer()
+    from database.tasks import get_tasks
+    from handlers.list_tasks import format_task
+    
+    tasks = await get_tasks(call.message.chat.id, task_type="morning")
+    
+    if not tasks:
+        text = "📅 На сегодня утренних задач нет. Отличный повод отдохнуть или добавить новую! ☕"
+    else:
+        parts = ["📅 <b>Сегодняшние утренние задачи:</b>\n"]
+        for task in tasks:
+            parts.append(await format_task(task))
+        text = "\n\n".join(parts)
+        text += "\n\n<i>Удалить: /delete &lt;id&gt;</i>"
+
+    try:
+        await call.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад в меню задач", callback_data="start_list")],
+                [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_tasks")]
+            ])
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+            
 # ──────────────────────────────────────────────────────────
 # Запасной обработчик для start_* кнопок
 # ──────────────────────────────────────────────────────────
