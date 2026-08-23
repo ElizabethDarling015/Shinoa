@@ -68,7 +68,11 @@ async def cb_goodbye_close(call: CallbackQuery):
             pass
     except Exception as e:
         logger.warning("Не удалось удалить прощальное сообщение: %s", e)
-    await call.answer()
+    
+    try:
+        await call.answer()
+    except TelegramBadRequest:
+        pass  # Callback устарел — игнорируем
 
 
 # ──────────────────────────────────────────────

@@ -7,6 +7,7 @@
 
 import shutil
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, date
@@ -22,10 +23,12 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 @asynccontextmanager
 async def get_db():
-    """Открывает соединение с БД как async context manager."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    """Открывает соединение с БД с защитой от блокировок при старте."""
+    # timeout=10.0 означает: ждать освобождения БД до 10 секунд
+    async with aiosqlite.connect(DB_PATH, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("PRAGMA busy_timeout = 10000")  # 10 секунд ожидания
         yield db
 
 
@@ -75,14 +78,18 @@ def _backup_before_migration(current_version: int):
     src = Path(DB_PATH)
     if not src.exists():
         return
-
+    
     backups_dir = Path("backups")
     backups_dir.mkdir(exist_ok=True)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dst = backups_dir / f"pre_migration_v{current_version}_{timestamp}.db"
-    shutil.copy2(src, dst)
-    logger.info("Резервная копия создана: %s", dst)
+    
+    # Выполняем синхронное копирование в отдельном потоке, чтобы не блокировать asyncio
+    asyncio.run_coroutine_threadsafe(
+        asyncio.to_thread(shutil.copy2, src, dst),
+        asyncio.get_event_loop()
+    )
+    logger.info("Резервная копия создана в фоновом режиме: %s", dst.name)
 
 
 async def backup_database():

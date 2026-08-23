@@ -23,13 +23,13 @@ def set_scheduler(scheduler):
 
 
 TYPE_LABELS = {
-    "weekly": "еженедельно",
-    "daily": "каждый день",
-    "monthly_day": "ежемесячно",
-    "monthly_date": "раз в год",
-    "morning": "разовое (утром)",
-    "interval": "с интервалом",
-    "workdays": "рабочие дни",
+    "weekly": "Еженедельно",
+    "daily": "Каждый день",
+    "monthly_day": "Ежемесячно",
+    "monthly_date": "Раз в год",
+    "morning": "Разовое (утром)",
+    "interval": "С интервалом",
+    "workdays": "Рабочие дни",
 }
 
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
@@ -42,6 +42,13 @@ def get_list_nav_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="start_list"),
             InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
         ]
+    ])
+
+
+def get_close_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с одной кнопкой 'Закрыть' для удаления сообщения"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_message")]
     ])
 
 
@@ -59,17 +66,17 @@ async def format_task(task: dict) -> str:
             else:
                 sched_lines.append(f"  каждый день в {s['time']}")
         elif task["type"] == "monthly_day":
-            sched_lines.append(f"  {s['day_of_month']}-е число в {s['time']}")
+            sched_lines.append(f"  <b>{s['day_of_month']}</b>-е число в {s['time']}")
         elif task["type"] == "monthly_date":
-            sched_lines.append(f"  {s['day_of_month']}.{s['month']:02d} в {s['time']}")
+            sched_lines.append(f"  <b>{s['day_of_month']}.{s['month']:02d}</b> в {s['time']}")
         elif task["type"] in ("daily", "morning", "workdays"):
             sched_lines.append(f"  {s['time']}")
 
     sched_text = "\n".join(sched_lines) if sched_lines else "  (нет расписания)"
 
     return (
-        f"{p} <b>{task['title']}</b>  <code>[#{task['id']}]</code>\n"
-        f"🏷 {task['category']} · {t_label}\n"
+        f"{p} <b>{task['title'].capitalize()}</b>  <code>[#{task['id']}]</code>\n"
+        f"🏷 {task['category'].capitalize()} 📌 {t_label}\n"
         f"🕐{sched_text}"
     )
 
@@ -87,7 +94,7 @@ async def cb_list_category(call: CallbackQuery):
     tasks = await db.get_tasks(call.message.chat.id, category=category)
 
     if not tasks:
-        text = f"📂 В категории «<b>{category}</b>» пока нет активных задач."
+        text = f"📂 В категории «<b>{category.capitalize()}</b>» пока нет активных задач."
         try:
             await call.message.edit_text(
                 text, parse_mode="HTML", reply_markup=get_list_nav_keyboard()
@@ -135,7 +142,7 @@ async def cb_list_category(call: CallbackQuery):
 # Отправка нового сообщения (для /list и кнопки "Все задачи")
 # ──────────────────────────────────────────────────────────
 
-async def send_task_list(message: Message, category: str = None, priority: str = None, exclude_type: str = None):
+async def send_task_list(message: Message, category: str = None, priority: str = None, exclude_type: str = None, use_close_keyboard: bool = False):
     """Основная логика показа списка задач — разбивка по приоритетам (Тир-1/2/3)"""
     # Передаем exclude_type в базу данных
     tasks = await db.get_tasks(message.chat.id, category=category, priority=priority, exclude_type=exclude_type)
@@ -183,14 +190,14 @@ async def send_task_list(message: Message, category: str = None, priority: str =
         # Заголовок сообщения
         header = f"<b>{tier_headers[tier_key]}</b>"
         if category:
-            header += f" · {category}"
+            header += f" · {category.capitalize()}"
         header += f"\n\n<i>Всего: {len(tier_tasks)}</i>"
 
         text = header + "\n\n" + "\n\n".join(parts)
         text += "\n\n<i>Удалить: /delete &lt;id&gt;</i>"
 
-        await message.answer(text, parse_mode="HTML", reply_markup=get_list_nav_keyboard())
-
+        keyboard = get_close_keyboard() if use_close_keyboard else get_list_nav_keyboard()
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 @router.message(Command("list"))
 async def cmd_list(message: Message):
@@ -241,4 +248,14 @@ async def cb_list_all(call: CallbackQuery):
     """Показывает ВСЕ задачи, КРОМЕ утренних (morning)"""
     await call.answer()
     # Передаем exclude_type="morning", чтобы утренние планы не попадали в этот список
-    await send_task_list(call.message, exclude_type="morning")
+    await send_task_list(call.message, exclude_type="morning", use_close_keyboard=True)
+
+
+@router.callback_query(F.data == "close_message")
+async def cb_close_message(call: CallbackQuery):
+    """Удаляет сообщение при нажатии кнопки 'Закрыть'"""
+    await call.answer()
+    try:
+        await call.message.delete()
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение: {e}")

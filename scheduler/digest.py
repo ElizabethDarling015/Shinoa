@@ -76,16 +76,29 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     else:
         lines.append(f"\n🌍 <b>Домашний внешний IP:</b> <i>недоступен</i>")
 
-    # ── Задачи на сегодня (по приоритету)
+    # ── Задачи на сегодня (разделяем на утренние и постоянные)
     tasks = await get_tasks(chat_id)
-    if tasks:
-        lines.append("\n<b>📋 Задачи:</b>")
-        for task in tasks[:10]:
+    
+    morning_tasks = [t for t in tasks if t.get("type") == "morning"]
+    regular_tasks = [t for t in tasks if t.get("type") != "morning"]
+
+    if morning_tasks:
+        lines.append("\n<b>🌅 Утренние задачи:</b>")
+        for task in morning_tasks[:10]:
             p = PRIORITY_EMOJI.get(task["priority"], "🟡")
             lines.append(f"  {p} {task['title']}")
-        if len(tasks) > 10:
-            lines.append(f"  <i>...и ещё {len(tasks) - 10}. Смотри /list</i>")
-    else:
+        if len(morning_tasks) > 10:
+            lines.append(f"  <i>...и ещё {len(morning_tasks) - 10}</i>")
+
+    if regular_tasks:
+        lines.append("\n<b>📋 Постоянные задачи:</b>")
+        for task in regular_tasks[:10]:
+            p = PRIORITY_EMOJI.get(task["priority"], "🟡")
+            lines.append(f"  {p} {task['title']}")
+        if len(regular_tasks) > 10:
+            lines.append(f"  <i>...и ещё {len(regular_tasks) - 10}. Смотри /list</i>")
+
+    if not morning_tasks and not regular_tasks:
         lines.append("\n✨ <i>Задач на сегодня нет</i>")
 
     # ── Привычки
