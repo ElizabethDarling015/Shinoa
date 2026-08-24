@@ -290,12 +290,48 @@ async def cb_task_morning(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "task_daily")
 async def cb_task_daily(call: CallbackQuery, state: FSMContext):
+    if not call.message:
+        await call.answer("Сообщение было удалено. Нажми /start", show_alert=True)
+        return
+
     await call.answer()
     await state.clear()
 
-    from handlers.daily import cmd_daily
+    from handlers.daily import NewDaily, get_daily_start_keyboard
 
-    await cmd_daily(call.message, state)
+    await state.set_state(NewDaily.title)
+
+    text = (
+        "📋 <b>Ежедневная задача</b>\n\n"
+        "Буду напоминать каждый день в заданное время.\n\n"
+        "Введите <b>название</b>:"
+    )
+
+    keyboard = get_daily_start_keyboard()
+    container_id = call.message.message_id
+
+    try:
+        await call.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            pass
+        else:
+            logger.warning(f"Не удалось отредактировать сообщение для Ежедневное: {e}")
+            new_msg = await call.message.answer(
+                text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            container_id = new_msg.message_id
+
+    await state.update_data(
+        bot_msg_id=container_id,
+        base_msg_id=container_id,
+    )
 
 
 @router.callback_query(F.data == "task_week")

@@ -41,6 +41,31 @@ def get_priority_inline() -> InlineKeyboardMarkup:
         get_nav_buttons()
     ])
 
+def get_daily_category_inline() -> InlineKeyboardMarkup:
+    """Категории для ежедневной задачи с уникальным префиксом daily_cat:*"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 Личное", callback_data="daily_cat:личное"),
+            InlineKeyboardButton(text="💼 Работа", callback_data="daily_cat:работа"),
+        ],
+        [
+            InlineKeyboardButton(text="💰 Финансы", callback_data="daily_cat:финансы"),
+            InlineKeyboardButton(text="❤️ Здоровье", callback_data="daily_cat:здоровье"),
+        ],
+        get_nav_buttons()
+    ])
+
+def get_daily_priority_inline() -> InlineKeyboardMarkup:
+    """Приоритеты для ежедневной задачи с уникальным префиксом daily_pri:*"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔴 Тир-1", callback_data="daily_pri:high"),
+            InlineKeyboardButton(text="🟡 Тир-2", callback_data="daily_pri:medium"),
+            InlineKeyboardButton(text="🟢 Тир-3", callback_data="daily_pri:low"),
+        ],
+        get_nav_buttons()
+    ])
+    
 def get_days_inline(current_days: list) -> InlineKeyboardMarkup:
     """Генерирует клавиатуру дней недели с отметками выбранных"""
     is_all = len(current_days) == 0 

@@ -24,11 +24,9 @@ router = Router()
 
 _scheduler = None
 
-
 def set_scheduler(scheduler):
     global _scheduler
     _scheduler = scheduler
-
 
 MONTHS = {
     "январь": 1, "февраль": 2, "март": 3, "апрель": 4,
@@ -41,7 +39,6 @@ MONTHS = {
 MONTH_NAMES = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
                "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
 
-
 class NewMonthly(StatesGroup):
     mode     = State()
     title    = State()
@@ -51,7 +48,6 @@ class NewMonthly(StatesGroup):
     day      = State()
     month    = State()
     time     = State()
-
 
 # ──────────────────────────────────────────────────────────
 # Запуск /monthly
@@ -69,7 +65,6 @@ async def cmd_monthly(message: Message, state: FSMContext):
         reply_markup=get_monthly_mode_keyboard(),
     )
 
-
 # ──────────────────────────────────────────────────────────
 # Обработка inline-кнопок выбора режима
 # ──────────────────────────────────────────────────────────
@@ -78,27 +73,31 @@ async def cmd_monthly(message: Message, state: FSMContext):
 async def cb_mode_day(call: CallbackQuery, state: FSMContext):
     await state.update_data(mode="day")
     await state.set_state(NewMonthly.title)
-    await call.message.edit_text(
-        "📅 <b>Режим: По числу определенного месяца</b>\n\n"
-        "Введите <b>название</b> напоминания:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
-    )
+    try:
+        await call.message.edit_text(
+            "📅 <b>Режим: По числу определенного месяца</b>\n\n"
+            "Введите <b>название</b> напоминания:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось отредактировать сообщение: {e}")
     await call.answer()
-
 
 @router.callback_query(F.data == "monthly_mode_date")
 async def cb_mode_date(call: CallbackQuery, state: FSMContext):
     await state.update_data(mode="date")
     await state.set_state(NewMonthly.title)
-    await call.message.edit_text(
-        "📆 <b>Режим: По дате (число + месяц)</b>\n\n"
-        "Введите <b>название</b> напоминания:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
-    )
+    try:
+        await call.message.edit_text(
+            "📆 <b>Режим: По дате (число + месяц)</b>\n\n"
+            "Введите <b>название</b> напоминания:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось отредактировать сообщение: {e}")
     await call.answer()
-
 
 # ──────────────────────────────────────────────────────────
 # Шаги FSM
@@ -117,7 +116,6 @@ async def step_title(message: Message, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
     )
 
-
 @router.message(NewMonthly.text)
 async def step_text(message: Message, state: FSMContext):
     await state.update_data(text=message.text.strip())
@@ -128,21 +126,30 @@ async def step_text(message: Message, state: FSMContext):
         reply_markup=get_category_inline()
     )
 
-
 @router.callback_query(F.data.startswith("cat:"))
 async def cb_category_monthly(call: CallbackQuery, state: FSMContext):
     """Обработчик выбора категории для /monthly"""
+    # Защита от старых кнопок
+    data = await state.get_data()
+    if not data.get("title") or not data.get("text"):
+        await call.answer("⚠️ Цепочка прервалась. Начни заново через /monthly", show_alert=True)
+        await state.clear()
+        return
+
     category = call.data.split(":")[1]
     await state.update_data(category=category)
     await state.set_state(NewMonthly.priority)
     
-    await call.message.edit_text(
-        f"Категория <b>{category}</b> выбрана.\n\nТеперь выберите <b>приоритет</b>:",
-        parse_mode="HTML",
-        reply_markup=priority_keyboard()
-    )
+    try:
+        await call.message.edit_text(
+            f"Категория <b>{category}</b> выбрана.\n\nТеперь выберите <b>приоритет</b>:",
+            parse_mode="HTML",
+            reply_markup=priority_keyboard()
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось отредактировать сообщение: {e}")
+    
     await call.answer()
-
 
 @router.message(NewMonthly.priority)
 async def step_priority(message: Message, state: FSMContext):
@@ -161,7 +168,6 @@ async def step_priority(message: Message, state: FSMContext):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
     )
-
 
 @router.message(NewMonthly.day)
 async def step_day(message: Message, state: FSMContext):
@@ -183,7 +189,7 @@ async def step_day(message: Message, state: FSMContext):
     if day > 28:
         warning = f"\n\n⚠️ В некоторых месяцах нет {day}-го числа — в такие месяцы напоминание не придёт."
 
-    if data["mode"] == "date":
+    if data.get("mode") == "date":
         await state.set_state(NewMonthly.month)
         await message.answer(
             f"Введите <b>месяц</b> (например: июнь, июня, 6):{warning}",
@@ -198,15 +204,12 @@ async def step_day(message: Message, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
         )
 
-
 @router.message(NewMonthly.month)
 async def step_month(message: Message, state: FSMContext):
     text = message.text.strip().lower()
     
-    # Пробуем найти месяц по названию
     month_num = MONTHS.get(text)
     
-    # Если не нашли, пробуем как число
     if not month_num:
         try:
             month_num = int(text)
@@ -214,7 +217,7 @@ async def step_month(message: Message, state: FSMContext):
                 raise ValueError
         except ValueError:
             await message.answer(
-                "Не поняла месяц.🙄 Введите название (июнь) или число (6).",
+                "Не понял месяц. Введите название (июнь) или число (6).",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
             )
             return
@@ -227,37 +230,53 @@ async def step_month(message: Message, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
     )
 
-
 @router.message(NewMonthly.time)
 async def step_time(message: Message, state: FSMContext):
     t = parse_time(message.text)
     if not t:
         await message.answer(
-            "Не поняла время.🙄 Формат: <code>10:00</code>",
+            "Не понял время. Формат: <code>10:00</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
         )
         return
 
     data = await state.get_data()
+    
+    # Защита от отсутствия данных
+    title = data.get("title")
+    text = data.get("text")
+    category = data.get("category")
+    priority = data.get("priority")
+    day = data.get("day")
+    mode = data.get("mode")
+    
+    if not title or not text or not category or not priority or not day or not mode:
+        await state.clear()
+        await message.answer(
+            "Данные потерялись. Начни заново через /monthly.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
+        )
+        return
+
     hour, minute = t
     time_str = f"{hour:02d}:{minute:02d}"
 
-    task_type = "monthly_day" if data["mode"] == "day" else "monthly_date"
+    task_type = "monthly_day" if mode == "day" else "monthly_date"
 
     task_id = await db.create_task(
         chat_id=message.chat.id,
-        title=data["title"],
-        text=data["text"],
+        title=title,
+        text=text,
         task_type=task_type,
-        category=data["category"],
-        priority=data["priority"],
+        category=category,
+        priority=priority,
     )
 
     schedule_id = await db.add_schedule(
         task_id=task_id,
         time=time_str,
-        day_of_month=data["day"],
+        day_of_month=day,
         month=data.get("month"),
     )
 
@@ -267,20 +286,20 @@ async def step_time(message: Message, state: FSMContext):
             "task_id": task_id,
             "time": time_str,
             "task_type": task_type,
-            "day_of_month": data["day"],
+            "day_of_month": day,
             "month": data.get("month"),
             "chat_id": message.chat.id,
-            "title": data["title"],
-            "text": data["text"],
-            "priority": data["priority"],
+            "title": title,
+            "text": text,
+            "priority": priority,
             "one_shot": False,
         }
         _scheduler.add_task_schedule(schedule)
 
-    if data["mode"] == "day":
-        schedule_desc = f"каждое {data['day']}-е число в {time_str}"
+    if mode == "day":
+        schedule_desc = f"каждое {day}-е число в {time_str}"
     else:
-        schedule_desc = f"каждый год {data['day']} {MONTH_NAMES[data['month']].lower()} в {time_str}"
+        schedule_desc = f"каждый год {day} {MONTH_NAMES[data['month']].lower()} в {time_str}"
 
     await state.clear()
     
@@ -296,17 +315,16 @@ async def step_time(message: Message, state: FSMContext):
     
     await message.answer(
         f"✅ <b>Ежемесячное напоминание создано!</b>\n\n"
-        f" {data['title']}\n"
+        f" {title}\n"
         f"📅 {schedule_desc}\n"
-        f"🏷 {data['category']} · {db.PRIORITIES[data['priority']]}\n\n",
+        f"🏷 {category} · {db.PRIORITIES[priority]}\n\n",
         parse_mode="HTML",
         reply_markup=success_kb
     )
 
-
 async def _cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "❌ Отменено.",
+        "🙄Ладно, забудем.🥱",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
     )
