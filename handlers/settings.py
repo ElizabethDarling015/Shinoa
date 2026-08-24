@@ -116,7 +116,7 @@ async def cb_system_stub(call: CallbackQuery):
 
 @router.callback_query(F.data == "system_update")
 async def cb_system_update(call: CallbackQuery):
-    """Обновление с GitHub: git pull + перезапуск. Все статусы — в одном сообщении."""
+    """Обновление с GitHub: git pull + pip install + перезапуск. Все статусы — в одном сообщении."""
     await call.answer()
 
     async def show(text: str, keyboard: InlineKeyboardMarkup = None):
@@ -129,6 +129,9 @@ async def cb_system_update(call: CallbackQuery):
 
     await show("⏳ Обновляюсь из репозитория...")
 
+    # ──────────────────────────────────────────────────────────
+    # ШАГ 1: git pull
+    # ──────────────────────────────────────────────────────────
     try:
         import shutil
         git_bin = shutil.which("git") or "/usr/bin/git"
@@ -166,7 +169,46 @@ async def cb_system_update(call: CallbackQuery):
         await show("✅ Уже актуально — обновлений нет.", get_settings_keyboard())
         return
 
-    await show("✅ Обновилась! Перезапускаюсь... 🔄")
+    # ──────────────────────────────────────────────────────────
+    # ШАГ 2: pip install -r requirements.txt
+    # ──────────────────────────────────────────────────────────
+    await show("✅ Код обновлён!\n⏳ Устанавливаю зависимости...")
+
+    try:
+        pip_proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "-r", "requirements.txt",
+            cwd=PROJECT_ROOT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        pip_stdout, _ = await asyncio.wait_for(pip_proc.communicate(), timeout=120)
+        pip_output = pip_stdout.decode().strip()
+    except asyncio.TimeoutError:
+        pip_proc.kill()
+        await show(
+            "❌ Таймаут установки зависимостей — pip завис. Попробуй позже.",
+            get_settings_keyboard(),
+        )
+        return
+    except Exception as e:
+        logger.exception("Ошибка установки зависимостей: %s", e)
+        await show(
+            f"❌ Не удалось установить зависимости:\n<code>{html.escape(str(e))}</code>",
+            get_settings_keyboard(),
+        )
+        return
+
+    if pip_proc.returncode != 0:
+        await show(
+            f"❌ Ошибка установки зависимостей:\n<code>{html.escape(pip_output[:1000])}</code>",
+            get_settings_keyboard(),
+        )
+        return
+
+    # ──────────────────────────────────────────────────────────
+    # ШАГ 3: Перезапуск бота
+    # ──────────────────────────────────────────────────────────
+    await show("✅ Код и зависимости обновлены!\n🔄 Перезапускаюсь...")
     asyncio.create_task(
         _restart_bot(call.message.chat.id, call.message.message_id)
     )
