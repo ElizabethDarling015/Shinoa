@@ -103,7 +103,7 @@ def get_tasks_main_keyboard() -> InlineKeyboardMarkup:
     """Главное меню нового списка задач"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📅 Сегодня", callback_data="tasks_menu:today"),
+            InlineKeyboardButton(text="📅 Сегодня в планах", callback_data="tasks_menu:today"),
             InlineKeyboardButton(text="📂 По категории", callback_data="tasks_menu:categories")
         ],
         [
@@ -386,48 +386,6 @@ async def cb_start_idea(call: CallbackQuery, state: FSMContext):
         text,
         get_idea_archive_keyboard(),
     )
-
-
-@router.callback_query(F.data=="tasks_categories")
-async def cb_tasks_categories(call: CallbackQuery):
-    """Открывает старое меню категорий"""
-    await call.answer()
-    await _safe_edit(
-        call.message,
-        "📂 <b>Выберите категорию:</b>",
-        get_task_categories_keyboard(),
-    )
-
-@router.callback_query(F.data=="tasks_today")
-async def cb_tasks_today(call: CallbackQuery):
-    """Показывает только утренние задачи на сегодня"""
-    await call.answer()
-    from database.tasks import get_tasks
-    from handlers.list_tasks import format_task
-    
-    tasks = await get_tasks(call.message.chat.id, task_type="morning")
-    
-    if not tasks:
-        text = "📅 На сегодня утренних задач нет. Отличный повод отдохнуть или добавить новую! ☕"
-    else:
-        parts = ["📅 <b>Сегодняшние утренние задачи:</b>\n"]
-        for task in tasks:
-            parts.append(await format_task(task))
-        text = "\n\n".join(parts)
-        text += "\n\n<i>Удалить: /delete &lt;id&gt;</i>"
-
-    try:
-        await call.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад в меню задач", callback_data="start_list")],
-                [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_tasks")]
-            ])
-        )
-    except Exception as e:
-        if "message is not modified" not in str(e).lower():
-            raise
 
             
 # ──────────────────────────────────────────────────────────

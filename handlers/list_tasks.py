@@ -57,22 +57,6 @@ def get_close_keyboard() -> InlineKeyboardMarkup:
 # НОВОЕ МЕНЮ ЗАДАЧ
 # ──────────────────────────────────────────────────────────
 
-def get_tasks_main_keyboard() -> InlineKeyboardMarkup:
-    """Главное меню нового списка задач"""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📅 Сегодня", callback_data="tasks_menu:today"),
-            InlineKeyboardButton(text="📂 Категории", callback_data="tasks_menu:categories")
-        ],
-        [
-            InlineKeyboardButton(text="🔴 Приоритет", callback_data="tasks_menu:priority"),
-            InlineKeyboardButton(text="📊 Сводка", callback_data="tasks_menu:summary")
-        ],
-        [
-            InlineKeyboardButton(text="🏠 На главную", callback_data="start_main")
-        ]
-    ])
-
 
 def get_task_categories_keyboard() -> InlineKeyboardMarkup:
     """Старое меню выбора категорий для списка задач"""
@@ -85,23 +69,8 @@ def get_task_categories_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💰 Финансы", callback_data="list_cat:финансы"),
             InlineKeyboardButton(text="❤️ Здоровье", callback_data="list_cat:здоровье"),
         ],
-        [InlineKeyboardButton(text="⬅️ Назад в меню задач", callback_data="tasks_menu:main")],
+        [InlineKeyboardButton(text="⬅️ Назад в меню задач", callback_data="start_list")],
     ])
-
-
-@router.callback_query(F.data == "tasks_menu:main")
-async def cb_tasks_main(call: CallbackQuery):
-    """Возврат в главное меню задач (РЕДАКТИРУЕТ сообщение)"""
-    await call.answer()
-    try:
-        await call.message.edit_text(
-            "📋 <b>Меню задач</b>\n\nВыберите удобный способ просмотра:",
-            parse_mode="HTML",
-            reply_markup=get_tasks_main_keyboard()
-        )
-    except Exception as e:
-        if "message is not modified" not in str(e).lower():
-            raise
 
 
 @router.callback_query(F.data == "tasks_menu:today")
@@ -125,7 +94,7 @@ async def cb_tasks_today(call: CallbackQuery):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="⬅️ Назад в задачи", callback_data="tasks_menu:main"),
+                    InlineKeyboardButton(text="⬅️ Назад в задачи", callback_data="start_list"),
                     InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main")
                 ]
             ])
