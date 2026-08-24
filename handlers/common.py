@@ -70,6 +70,34 @@ def get_daily_category_inline() -> InlineKeyboardMarkup:
         get_nav_buttons()
     ])
 
+
+def get_month_category_inline() -> InlineKeyboardMarkup:
+    """Категории для ежемесячной задачи с уникальным префиксом month_cat:*"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 Личное", callback_data="month_cat:личное"),
+            InlineKeyboardButton(text="💼 Работа", callback_data="month_cat:работа"),
+        ],
+        [
+            InlineKeyboardButton(text="💰 Финансы", callback_data="month_cat:финансы"),
+            InlineKeyboardButton(text="❤️ Здоровье", callback_data="month_cat:здоровье"),
+        ],
+        get_nav_buttons()
+    ])
+
+
+def get_monthly_priority_inline() -> InlineKeyboardMarkup:
+    """Inline-приоритеты для ежемесячной задачи (вместо reply-клавиатуры)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔴 Тир-1", callback_data="month_pri:high"),
+            InlineKeyboardButton(text="🟡 Тир-2", callback_data="month_pri:medium"),
+            InlineKeyboardButton(text="🟢 Тир-3", callback_data="month_pri:low"),
+        ],
+        get_nav_buttons()
+    ])
+    
+
 def get_daily_priority_inline() -> InlineKeyboardMarkup:
     """Приоритеты для ежедневной задачи с уникальным префиксом daily_pri:*"""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -82,11 +110,14 @@ def get_daily_priority_inline() -> InlineKeyboardMarkup:
     ])
 
 def get_days_inline(current_days: list) -> InlineKeyboardMarkup:
-    """Генерирует клавиатуру дней недели с отметками выбранных"""
-    is_all = len(current_days) == 0
+    """Генерирует клавиатуру дней недели с отметками выбранных.
+
+    Изначально галочек нет — пользователь проставляет дни сам.
+    Кнопки «Каждый день» больше нет (для этого есть /daily).
+    """
 
     def fmt(day_name, day_num):
-        selected = "✅ " if (day_num in current_days or is_all) else ""
+        selected = "✅ " if day_num in current_days else ""
         return f"{selected}{day_name}"
 
     keyboard = [
@@ -100,7 +131,6 @@ def get_days_inline(current_days: list) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=fmt("Пт", 4), callback_data="week_day:4"),
             InlineKeyboardButton(text=fmt("Сб", 5), callback_data="week_day:5"),
             InlineKeyboardButton(text=fmt("Вс", 6), callback_data="week_day:6"),
-            InlineKeyboardButton(text="✅ Каждый день" if is_all else "Каждый день", callback_data="week_day:all"),
         ],
         [
             InlineKeyboardButton(text="➡️ Далее: Время", callback_data="week_days_next")

@@ -75,12 +75,7 @@ def get_week_time_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_week_result_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            *_make_nav_keyboard(),
-            [InlineKeyboardButton(text="📋 Посмотреть все", callback_data="start_list")],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=_make_nav_keyboard())
 
 
 def _week_text_question(title: str) -> str:
@@ -423,16 +418,19 @@ async def cb_day_toggle(call: CallbackQuery, state: FSMContext):
         return
 
     day_val = call.data.split(":")[1]
+
+    # Кнопка «Каждый день» осталась только на старых сообщениях в истории
+    if day_val == "all":
+        await call.answer("Кнопка «Каждый день» больше недоступна — выбери отдельные дни 🙂")
+        return
+
     current_days = data.get("selected_days", [])
 
-    if day_val == "all":
-        current_days = []
+    day_num = int(day_val)
+    if day_num in current_days:
+        current_days.remove(day_num)
     else:
-        day_num = int(day_val)
-        if day_num in current_days:
-            current_days.remove(day_num)
-        else:
-            current_days.append(day_num)
+        current_days.append(day_num)
 
     await state.update_data(selected_days=current_days)
 
@@ -450,6 +448,11 @@ async def cb_days_next(call: CallbackQuery, state: FSMContext):
     if not data.get("title") or not data.get("priority"):
         await call.answer("⚠️ Цепочка прервалась. Начни заново через /week", show_alert=True)
         await state.clear()
+        return
+
+    # Требуем хотя бы один выбранный день
+    if not data.get("selected_days"):
+        await call.answer("⚠️ Сначала выбери хотя бы один день недели", show_alert=True)
         return
 
     await state.set_state(NewWeek.time)

@@ -71,18 +71,9 @@ async def _set_daily_container_id(state: FSMContext, message_id: int):
     await state.update_data(bot_msg_id=message_id, base_msg_id=message_id)
 
 
-def _daily_cancel_button() -> InlineKeyboardButton:
-    return InlineKeyboardButton(text="⬅️ Отмена", callback_data="cancel_daily")
-
-
 def get_daily_start_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура для первого шага /daily."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [_daily_cancel_button()],
-            *_make_nav_keyboard(),
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=_make_nav_keyboard())
 
 
 def get_daily_result_keyboard() -> InlineKeyboardMarkup:
@@ -298,7 +289,7 @@ async def daily_title(message: Message, state: FSMContext):
         chat_id=message.chat.id,
         state=state,
         text=_daily_text_question(user_text),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_daily_cancel_button()], *_make_nav_keyboard()]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=_make_nav_keyboard()),
         fallback_message=message,
     )
 
@@ -429,7 +420,7 @@ async def cb_priority_daily(call: CallbackQuery, state: FSMContext):
         chat_id=call.message.chat.id,
         state=state,
         text=_daily_time_question(title, text, category, priority),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_daily_cancel_button()], *_make_nav_keyboard()]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=_make_nav_keyboard()),
         fallback_message=call.message,
     )
 
@@ -475,7 +466,7 @@ async def daily_time(message: Message, state: FSMContext):
             chat_id=message.chat.id,
             state=state,
             text=_daily_time_question(title, text, category, priority) + "\n\n⚠️ Не поняла время. Формат: <code>09:00</code>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_daily_cancel_button()], *_make_nav_keyboard()]),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=_make_nav_keyboard()),
             fallback_message=message,
         )
 

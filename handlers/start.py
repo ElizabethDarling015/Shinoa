@@ -382,12 +382,32 @@ async def cb_task_week(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "task_month")
 async def cb_task_month(call: CallbackQuery, state: FSMContext):
+    if not call.message:
+        await call.answer("Сообщение было удалено. Нажми /start", show_alert=True)
+        return
+
     await call.answer()
     await state.clear()
 
-    from handlers.monthly import cmd_monthly
+    from handlers.monthly import NewMonthly, get_month_start_keyboard, _month_mode_question
 
-    await cmd_monthly(call.message, state)
+    await state.set_state(NewMonthly.mode)
+
+    text = _month_mode_question()
+    keyboard = get_month_start_keyboard()
+    container_id = call.message.message_id
+
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            pass
+        else:
+            logger.warning(f"Не удалось отредактировать сообщение для Ежемесячное: {e}")
+            new_msg = await call.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+            container_id = new_msg.message_id
+
+    await state.update_data(bot_msg_id=container_id, base_msg_id=container_id)
 
 
 # ──────────────────────────────────────────────────────────
