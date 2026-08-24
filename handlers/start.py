@@ -270,22 +270,37 @@ async def cb_start_help(call: CallbackQuery):
 
 @router.callback_query(F.data == "task_morning")
 async def cb_task_morning(call: CallbackQuery, state: FSMContext):
+    if not call.message:
+        await call.answer("Сообщение было удалено. Нажми /start", show_alert=True)
+        return
+
     await call.answer()
     await state.clear()
-    
-    # 🔥 ФИКС: Сохраняем ID этого сообщения как "базовый контейнер" для всех шагов
-    await state.update_data(base_msg_id=call.message.message_id)
-    
-    from handlers.daily import NewMorning
+
+    from handlers.daily import NewMorning, get_morning_start_keyboard
+
     await state.set_state(NewMorning.text)
 
-    await _safe_edit(
-        call.message,
+    text = (
         "🌅 <b>Задача на завтра утром</b>\n\n"
         "Напишу тебе завтра в нужное время и задача исчезнет.\n\n"
-        "Что нужно сделать?",
-        InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()]),
+        "Что нужно сделать?"
     )
+
+    keyboard = get_morning_start_keyboard()
+    container_id = call.message.message_id
+
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            pass
+        else:
+            logger.warning(f"Не удалось отредактировать сообщение для Планы на завтра: {e}")
+            new_msg = await call.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+            container_id = new_msg.message_id
+
+    await state.update_data(bot_msg_id=container_id, base_msg_id=container_id)
 
 
 @router.callback_query(F.data == "task_daily")
@@ -336,12 +351,33 @@ async def cb_task_daily(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "task_week")
 async def cb_task_week(call: CallbackQuery, state: FSMContext):
+    if not call.message:
+        await call.answer("Сообщение было удалено. Нажми /start", show_alert=True)
+        return
+
     await call.answer()
     await state.clear()
 
-    from handlers.weekly import cmd_week
+    from handlers.weekly import NewWeek, get_week_start_keyboard
 
-    await cmd_week(call.message, state)
+    await state.set_state(NewWeek.title)
+    await state.update_data(selected_days=[])
+
+    text = "📆 <b>Еженедельное напоминание</b>\n\nВведите <b>название</b> задачи:"
+    keyboard = get_week_start_keyboard()
+    container_id = call.message.message_id
+
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            pass
+        else:
+            logger.warning(f"Не удалось отредактировать сообщение для Еженедельное: {e}")
+            new_msg = await call.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+            container_id = new_msg.message_id
+
+    await state.update_data(bot_msg_id=container_id, base_msg_id=container_id)
 
 
 @router.callback_query(F.data == "task_month")

@@ -31,6 +31,20 @@ def get_category_inline() -> InlineKeyboardMarkup:
         get_nav_buttons()
     ])
 
+def get_week_category_inline() -> InlineKeyboardMarkup:
+    """Категории для еженедельной задачи с уникальным префиксом week_cat:*"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 Личное", callback_data="week_cat:личное"),
+            InlineKeyboardButton(text="💼 Работа", callback_data="week_cat:работа"),
+        ],
+        [
+            InlineKeyboardButton(text="💰 Финансы", callback_data="week_cat:финансы"),
+            InlineKeyboardButton(text="❤️ Здоровье", callback_data="week_cat:здоровье"),
+        ],
+        get_nav_buttons()
+    ])
+
 def get_priority_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -40,6 +54,7 @@ def get_priority_inline() -> InlineKeyboardMarkup:
         ],
         get_nav_buttons()
     ])
+
 
 def get_daily_category_inline() -> InlineKeyboardMarkup:
     """Категории для ежедневной задачи с уникальным префиксом daily_cat:*"""
@@ -65,11 +80,11 @@ def get_daily_priority_inline() -> InlineKeyboardMarkup:
         ],
         get_nav_buttons()
     ])
-    
+
 def get_days_inline(current_days: list) -> InlineKeyboardMarkup:
     """Генерирует клавиатуру дней недели с отметками выбранных"""
-    is_all = len(current_days) == 0 
-    
+    is_all = len(current_days) == 0
+
     def fmt(day_name, day_num):
         selected = "✅ " if (day_num in current_days or is_all) else ""
         return f"{selected}{day_name}"
