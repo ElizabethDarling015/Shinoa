@@ -214,7 +214,7 @@ async def step_month(message: Message, state: FSMContext):
                 raise ValueError
         except ValueError:
             await message.answer(
-                "Не понял месяц. Введите название (июнь) или число (6).",
+                "Не поняла месяц.🙄 Введите название (июнь) или число (6).",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
             )
             return
@@ -233,7 +233,7 @@ async def step_time(message: Message, state: FSMContext):
     t = parse_time(message.text)
     if not t:
         await message.answer(
-            "Не понял время. Формат: <code>10:00</code>",
+            "Не поняла время.🙄 Формат: <code>10:00</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
         )

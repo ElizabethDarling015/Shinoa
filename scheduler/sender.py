@@ -75,3 +75,56 @@ async def send_reminder(
 
     except Exception as e:
         logger.error("Ошибка отправки → чат %s: %s", chat_id, e)
+
+def _pre_days_label(days: int) -> str:
+    """
+    Красивая подпись для предварительного напоминания.
+    """
+    labels = {
+        7: "7 дней",
+        3: "3 дня",
+        1: "сутки",
+    }
+    return labels.get(days, f"{days} дн.")
+
+
+async def send_yearly_pre_reminder(
+    bot: Bot,
+    chat_id: int,
+    title: str,
+    text: str,
+    priority: str = "medium",
+    days_left: int = 7,
+    occurrence_date: str = "",
+):
+    """
+    Отправляет предварительное уведомление к годовому напоминанию.
+    Например, за 7 дней / 3 дня / сутки до основной даты.
+    """
+    p_emoji = PRIORITY_EMOJI.get(priority, "🟡")
+    label = _pre_days_label(days_left)
+
+    msg = (
+        f"⏳ <b>Предварительное напоминание</b>\n\n"
+        f"Через {label} ({occurrence_date}) будет годовое напоминание:\n"
+        f"{p_emoji} <b>{title}</b>\n\n"
+        f"{text}"
+    )
+
+    try:
+        await bot.send_message(
+            chat_id,
+            msg,
+            parse_mode="HTML",
+        )
+        logger.info(
+            "Предварительное напоминание отправлено → чат %s: за %s",
+            chat_id,
+            label,
+        )
+    except Exception as e:
+        logger.error(
+            "Ошибка предварительного напоминания → чат %s: %s",
+            chat_id,
+            e,
+        )

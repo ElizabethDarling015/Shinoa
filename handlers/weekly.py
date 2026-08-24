@@ -146,7 +146,7 @@ async def step_time(message: Message, state: FSMContext):
     t = parse_time(message.text)
     if not t:
         await message.answer(
-            "Не понял время. Используйте формат ЧЧ:ММ, например <code>09:00</code>", 
+            "Не поняла время.🙄 Используйте формат ЧЧ:ММ, например <code>09:00</code>", 
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[get_nav_buttons()])
         )

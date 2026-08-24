@@ -6,10 +6,11 @@
 
 import logging
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from aiogram import Bot
 
 from config import DEFAULT_TIMEZONE
@@ -17,11 +18,12 @@ from database.connection import run_migrations, backup_database
 from database.schedules import get_all_active_schedules
 from database.habits import get_all_active_habits
 from scheduler.triggers import make_trigger
-from scheduler.sender import send_reminder
+from scheduler.sender import send_reminder, send_yearly_pre_reminder
 from scheduler.digest import send_digest
 
 logger = logging.getLogger(__name__)
 
+YEARLY_PRE_OFFSETS = (7, 3, 1)
 
 class ReminderScheduler:
     def __init__(self, bot: Bot, default_timezone: str = DEFAULT_TIMEZONE):
@@ -76,6 +78,13 @@ class ReminderScheduler:
             replace_existing=True,
             kwargs={"bot": self.bot},
         )
+        # Ежедневное обновление предварительных напоминаний для годовых задач
+        self.scheduler.add_job(
+            self._refresh_yearly_pre_jobs,
+            CronTrigger(hour=0, minute=5, timezone=self.default_timezone),
+            id="refresh_yearly_pre_jobs",
+            replace_existing=True,
+        )
 
     # ──────────────────────────────────────────
     # Утренняя сводка с учётом таймзона пользователя
@@ -124,6 +133,7 @@ class ReminderScheduler:
 
     def _add_task_job(self, schedule: dict):
         trigger = make_trigger(schedule, self.default_timezone)
+
         self.scheduler.add_job(
             send_reminder,
             trigger=trigger,
@@ -141,18 +151,219 @@ class ReminderScheduler:
             },
         )
 
+        task_type = schedule.get("task_type") or schedule.get("type")
+
+        # Для годовых напоминаний добавляем предварительные уведомления
+        if task_type == "monthly_date":
+            self._add_yearly_pre_jobs(schedule)
+
     def add_task_schedule(self, schedule: dict):
         """Вызывается хендлером после сохранения расписания в БД."""
         self._add_task_job(schedule)
 
     def remove_task_schedule(self, schedule_id: int):
+        """
+        Удаляет основное задание и все предварительные задания для расписания.
+        """
+        try:
+            schedule_id = int(schedule_id)
+            self._remove_pre_jobs_for_schedule(schedule_id)
+        except (TypeError, ValueError):
+            pass
+
         job_id = self._task_job_id(schedule_id)
+
         if self.scheduler.get_job(job_id):
             self.scheduler.remove_job(job_id)
 
     def remove_all_for_task(self, schedule_ids: list[int]):
         for sid in schedule_ids:
             self.remove_task_schedule(sid)
+    
+        # ──────────────────────────────────────────
+    # Предварительные напоминания для годовых задач
+    # ──────────────────────────────────────────
+
+    def _pre_job_id(self, schedule_id: int, days: int) -> str:
+        """
+        ID задания предварительного напоминания.
+        Пример: pre_7_12
+        """
+        return f"pre_{days}_{schedule_id}"
+
+    def _remove_pre_jobs_for_schedule(self, schedule_id: int):
+        """
+        Удаляет все предварительные задания для конкретного расписания.
+        """
+        suffix = f"_{schedule_id}"
+
+        for job in list(self.scheduler.get_jobs()):
+            if job.id and job.id.startswith("pre_") and job.id.endswith(suffix):
+                try:
+                    self.scheduler.remove_job(job.id)
+                except Exception:
+                    pass
+
+    def _next_yearly_occurrence(
+        self,
+        month: int,
+        day: int,
+        hour: int,
+        minute: int,
+        now: datetime,
+        tz,
+    ):
+        """
+        Возвращает ближайшую будущую дату годового напоминания.
+        Например, если сейчас 2026 год и дата уже прошла, вернёт 2027 год.
+        """
+        year = now.year
+
+        # Проверяем текущий год и несколько следующих.
+        # Запас нужен, например, для 29 февраля.
+        for _ in range(12):
+            try:
+                candidate = tz.localize(
+                    datetime(
+                        year,
+                        month,
+                        day,
+                        hour,
+                        minute,
+                        second=0,
+                        microsecond=0,
+                    )
+                )
+
+                if candidate > now:
+                    return candidate
+
+            except ValueError:
+                # Например, 30 февраля или 29 февраля в невисокосный год.
+                pass
+
+            year += 1
+
+        return None
+
+    def _add_yearly_pre_jobs(self, schedule: dict):
+        """
+        Создаёт задания за 7 дней / 3 дня / сутки до годового напоминания.
+        """
+        schedule_id = schedule.get("id")
+
+        if not schedule_id:
+            return
+
+        try:
+            schedule_id = int(schedule_id)
+        except (TypeError, ValueError):
+            return
+
+        chat_id = schedule.get("chat_id")
+
+        if not chat_id:
+            return
+
+        # Сначала удаляем старые предварительные задания для этого расписания
+        self._remove_pre_jobs_for_schedule(schedule_id)
+
+        try:
+            month = int(schedule.get("month") or 0)
+            day = int(schedule.get("day_of_month") or 0)
+
+            if not (1 <= month <= 12 and 1 <= day <= 31):
+                return
+
+            time_str = str(schedule.get("time") or "00:00")
+            hour, minute = map(int, time_str.split(":"))
+
+            tz = pytz.timezone(self.default_timezone)
+            now = datetime.now(tz)
+
+            occurrence = self._next_yearly_occurrence(
+                month=month,
+                day=day,
+                hour=hour,
+                minute=minute,
+                now=now,
+                tz=tz,
+            )
+
+            if not occurrence:
+                return
+
+            for days in YEARLY_PRE_OFFSETS:
+                run_date = tz.normalize(occurrence - timedelta(days=days))
+
+                if run_date > now:
+                    self.scheduler.add_job(
+                        send_yearly_pre_reminder,
+                        trigger=DateTrigger(run_date=run_date, timezone=tz),
+                        id=self._pre_job_id(schedule_id, days),
+                        replace_existing=True,
+                        kwargs={
+                            "bot": self.bot,
+                            "chat_id": chat_id,
+                            "title": schedule.get("title", ""),
+                            "text": schedule.get("text", ""),
+                            "priority": schedule.get("priority", "medium"),
+                            "days_left": days,
+                            "occurrence_date": occurrence.strftime("%d.%m.%Y %H:%M"),
+                        },
+                    )
+
+        except Exception as e:
+            logger.error(
+                "Не удалось добавить предварительные напоминания для расписания %s: %s",
+                schedule_id,
+                e,
+            )
+
+    async def _refresh_yearly_pre_jobs(self):
+        """
+        Ежедневно пересоздаёт предварительные задания для годовых напоминаний.
+        Это нужно, чтобы после наступления даты напоминания создать пред-уведомления
+        уже на следующий год.
+        """
+        try:
+            schedules = await get_all_active_schedules()
+        except Exception as e:
+            logger.error(
+                "Не удалось загрузить расписания для обновления годовых пред-напоминаний: %s",
+                e,
+            )
+            return
+
+        active_yearly_ids = set()
+
+        for schedule in schedules:
+            task_type = schedule.get("task_type") or schedule.get("type")
+
+            if task_type != "monthly_date":
+                continue
+
+            try:
+                schedule_id = int(schedule.get("id"))
+            except (TypeError, ValueError):
+                continue
+
+            active_yearly_ids.add(schedule_id)
+            self._add_yearly_pre_jobs(schedule)
+
+        # Удаляем пред-напоминания для задач, которых больше нет среди активных
+        for job in list(self.scheduler.get_jobs()):
+            if not job.id or not job.id.startswith("pre_"):
+                continue
+
+            try:
+                schedule_id = int(job.id.rsplit("_", 1)[-1])
+
+                if schedule_id not in active_yearly_ids:
+                    self.scheduler.remove_job(job.id)
+
+            except Exception:
+                pass
 
     def add_snooze_job(self, trigger, chat_id, task_id, schedule_id, title, text, priority):
         """Добавляет одноразовое задание после snooze."""

@@ -153,7 +153,7 @@ async def habit_target(message: Message, state: FSMContext):
 async def habit_time(message: Message, state: FSMContext):
     t = parse_time(message.text)
     if not t:
-        await message.answer("Не понял время. Формат: <code>21:00</code>", parse_mode="HTML")
+        await message.answer("Не поняла время.🙄 Формат: <code>21:00</code>", parse_mode="HTML")
         return
 
     data = await state.get_data()
