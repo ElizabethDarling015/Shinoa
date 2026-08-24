@@ -272,9 +272,11 @@ async def cb_start_help(call: CallbackQuery):
 async def cb_task_morning(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.clear()
-
+    
+    # 🔥 ФИКС: Сохраняем ID этого сообщения как "базовый контейнер" для всех шагов
+    await state.update_data(base_msg_id=call.message.message_id)
+    
     from handlers.daily import NewMorning
-
     await state.set_state(NewMorning.text)
 
     await _safe_edit(
