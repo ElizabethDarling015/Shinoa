@@ -15,8 +15,10 @@ router = Router()
 
 
 def get_data_processing_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура подменю 'Работа с данными' (кнопки наравне, главная растянута)"""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    """Клавиатура подменю 'Работа с данными': существующие инструменты + сервисы из реестра (парсеры и т.п.)."""
+    from services.service_registry import list_services
+
+    rows = [
         [
             InlineKeyboardButton(text="🌤 Прогноз", callback_data="data_weather"),
             InlineKeyboardButton(text="📊 За месяц", callback_data="data_monthly_work"),
@@ -25,14 +27,19 @@ def get_data_processing_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🎙 Транскрибация", callback_data="data_transcribe"),
             InlineKeyboardButton(text="📓 Obsidian", callback_data="data_obsidian"),
         ],
-        [
-            InlineKeyboardButton(text="🌐 Мой IP", callback_data="data_myip"),
-            InlineKeyboardButton(text="➖", callback_data="data_stub"),
-        ],
-        [
-            InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
-        ]
-    ])
+    ]
+
+    # "Мой IP" и все сервисы из реестра пакуются по 2 в ряд — так они не
+    # растягиваются по одному в ряд и новые сервисы просто продолжают сетку.
+    tail_buttons = [InlineKeyboardButton(text="🌐 Мой IP", callback_data="data_myip")]
+    for service_id, cfg in list_services():
+        tail_buttons.append(InlineKeyboardButton(text=cfg["title"], callback_data=f"svc_open:{service_id}"))
+
+    for i in range(0, len(tail_buttons), 2):
+        rows.append(tail_buttons[i:i + 2])
+
+    rows.append([InlineKeyboardButton(text="🏠 На главную", callback_data="start_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data == "start_data")

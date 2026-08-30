@@ -4,7 +4,7 @@
 
 from aiogram import Router
 
-from handlers import weekly, monthly, daily, list_tasks, snooze, habits, archive, stats, settings, data_processing
+from handlers import weekly, monthly, daily, list_tasks, snooze, habits, archive, stats, settings, data_processing, services_control
 
 main_router = Router()
 main_router.include_router(weekly.router)
@@ -17,6 +17,7 @@ main_router.include_router(archive.router)
 main_router.include_router(stats.router)
 main_router.include_router(settings.router)
 main_router.include_router(data_processing.router)
+main_router.include_router(services_control.router)
 
 
 def set_scheduler(scheduler):
