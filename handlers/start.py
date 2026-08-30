@@ -192,6 +192,12 @@ async def _safe_edit(
 async def cmd_start(message: Message):
     from database.users import upsert_user
 
+    # Удаляем сообщение пользователя с командой /start
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение пользователя: {e}")
+
     await upsert_user(message.chat.id)
 
     await message.answer(
