@@ -3,17 +3,19 @@
 
 Содержимое:
   ☀️ Погода (если настроен город)
-  📋 Задачи на сегодня (по приоритету)
+  🌅 Сегодняшние задачи (созданные вчера и ранее)
+  🌙 Завтрашние задачи (созданные сегодня)
   💪 Привычки на сегодня
 
 Сводка закрепляется в чате; при следующей сводке предыдущая открепляется.
 """
 
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import pytz
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import DEFAULT_TIMEZONE, WEATHER_API_KEY, HOST_IP_URL
 from services.weather import get_weather
@@ -23,6 +25,17 @@ logger = logging.getLogger(__name__)
 
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 WEEKDAY_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+def _get_local_date(created_at_str: str, tz) -> date:
+    """Безопасно парсит дату создания задачи из SQLite (UTC) в локальную дату."""
+    try:
+        # SQLite datetime('now') сохраняет в формате "YYYY-MM-DD HH:MM:SS" (UTC)
+        dt = datetime.strptime(created_at_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
+        dt = pytz.utc.localize(dt)
+        return dt.astimezone(tz).date()
+    except Exception:
+        return date.today()
 
 
 async def get_home_ip() -> str | None:
@@ -42,8 +55,7 @@ async def get_home_ip() -> str | None:
 
 async def build_digest_text(chat_id: int, city: str = None) -> str:
     """
-    Собирает текст утренней сводки. Используется и планировщиком,
-    и кнопкой «🌅 Сегодняшняя сводка» в меню списка задач.
+    Собирает текст утренней сводки.
     """
     from database.tasks import get_tasks
     from database.habits import get_habits, is_done_today
@@ -52,6 +64,8 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     now = datetime.now(tz)
     today = date.today()
     weekday = WEEKDAY_RU[now.weekday()]
+    
+    today_date = now.date()
 
     lines = []
 
@@ -69,37 +83,46 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     elif city:
         lines.append(f"\n🌡 <i>Погода недоступна — добавь WEATHER_API_KEY в config.py</i>")
         
-    # ── Домашний внешний IP (под прогнозом) — выводится всегда
+    # ── Домашний внешний IP
     home_ip = await get_home_ip()
     if home_ip:
         lines.append(f"\n🌍 <b>Домашний внешний IP:</b> <code>{home_ip}</code>")
     else:
         lines.append(f"\n🌍 <b>Домашний внешний IP:</b> <i>недоступен</i>")
 
-    # ── Задачи на сегодня (разделяем на утренние и постоянные)
+    # ── Задачи (Сегодняшние и Завтрашние)
     tasks = await get_tasks(chat_id)
-    
     morning_tasks = [t for t in tasks if t.get("type") == "morning"]
-    regular_tasks = [t for t in tasks if t.get("type") != "morning"]
+    
+    today_tasks = []
+    tomorrow_tasks = []
+    
+    for t in morning_tasks:
+        task_date = _get_local_date(t['created_at'], tz)
+        if task_date < today_date:
+            today_tasks.append(t)
+        elif task_date == today_date:
+            tomorrow_tasks.append(t)
 
-    if morning_tasks:
-        lines.append("\n<b>🌅 Утренние задачи:</b>")
-        for task in morning_tasks[:10]:
+    # Блок: Сегодняшние задачи
+    lines.append("\n<b>🌅 Сегодняшние задачи:</b>")
+    if today_tasks:
+        for task in today_tasks[:10]:
             p = PRIORITY_EMOJI.get(task["priority"], "🟡")
             lines.append(f"  {p} {task['title']}")
-        if len(morning_tasks) > 10:
-            lines.append(f"  <i>...и ещё {len(morning_tasks) - 10}</i>")
+        if len(today_tasks) > 10:
+            lines.append(f"  <i>...и ещё {len(today_tasks) - 10}</i>")
+    else:
+        lines.append("  <i>На сегодня задач нет</i>")
 
-    if regular_tasks:
-        lines.append("\n<b>📋 Постоянные задачи:</b>")
-        for task in regular_tasks[:10]:
+    # Блок: Завтрашние задачи
+    if tomorrow_tasks:
+        lines.append("\n<b>🌙 Завтрашние задачи:</b>")
+        for task in tomorrow_tasks[:10]:
             p = PRIORITY_EMOJI.get(task["priority"], "🟡")
             lines.append(f"  {p} {task['title']}")
-        if len(regular_tasks) > 10:
-            lines.append(f"  <i>...и ещё {len(regular_tasks) - 10}. Смотри /list</i>")
-
-    if not morning_tasks and not regular_tasks:
-        lines.append("\n✨ <i>Задач на сегодня нет</i>")
+        if len(tomorrow_tasks) > 10:
+            lines.append(f"  <i>...и ещё {len(tomorrow_tasks) - 10}</i>")
 
     # ── Привычки
     habits = await get_habits(chat_id)
@@ -148,11 +171,63 @@ async def _set_last_digest_pin(chat_id: int, message_id: int):
 
 
 # ──────────────────────────────────────────────
+# Очистка просроченных задач
+# ──────────────────────────────────────────────
+
+async def process_expired_morning_tasks(bot: Bot, chat_id: int):
+    """
+    Удаляет задачи, созданные раньше вчерашнего дня (позавчера и старее).
+    Отправляет уведомление о каждой такой задаче.
+    """
+    tz = pytz.timezone(DEFAULT_TIMEZONE)
+    today_date = datetime.now(tz).date()
+    yesterday_date = today_date - timedelta(days=1)
+    
+    async with get_db() as conn:
+        async with conn.execute(
+            "SELECT id, title, text, created_at FROM tasks WHERE chat_id = ? AND type = 'morning' AND status = 'active'",
+            (chat_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+            
+        expired_ids = []
+        for row in rows:
+            task_dict = dict(row)
+            task_date = _get_local_date(task_dict['created_at'], tz)
+            
+            # Если задача создана РАНЬШЕ вчерашнего дня, она просрочена
+            if task_date < yesterday_date:
+                expired_text = f"⏰ <b>Вчерашняя задача не выполнена:</b>\n\n<b>{task_dict['title']}</b>"
+                if task_dict.get('text'):
+                    expired_text += f"\n<i>{task_dict['text']}</i>"
+                    
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Закрыть уведомление", callback_data="close_message")]
+                ])
+                try:
+                    await bot.send_message(chat_id, expired_text, parse_mode="HTML", reply_markup=kb)
+                except Exception as e:
+                    logger.warning("Не удалось отправить уведомление о просроченной задаче: %s", e)
+                    
+                expired_ids.append(task_dict['id'])
+                
+        if expired_ids:
+            placeholders = ','.join('?' * len(expired_ids))
+            await conn.execute(f"UPDATE tasks SET status = 'deleted' WHERE id IN ({placeholders})", expired_ids)
+            await conn.commit()
+
+
+# ──────────────────────────────────────────────
 # Отправка
 # ──────────────────────────────────────────────
 
 async def send_digest(bot: Bot, chat_id: int, city: str = None):
     """Собирает и отправляет утреннюю сводку, закрепляя её (старая открепляется)."""
+    
+    # 1. СНАЧАЛА очищаем просроченные утренние задачи и шлем уведомления о них
+    await process_expired_morning_tasks(bot, chat_id)
+    
+    # 2. ЗАТЕМ собираем и отправляем саму сводку
     text = await build_digest_text(chat_id, city)
 
     try:
@@ -162,7 +237,6 @@ async def send_digest(bot: Bot, chat_id: int, city: str = None):
         logger.error("Ошибка отправки сводки → чат %s: %s", chat_id, e)
         return
 
-    # ── Закрепление: открепляем прошлую, закрепляем новую
     try:
         old_id = await _get_last_digest_pin(chat_id)
         if old_id:
@@ -174,12 +248,11 @@ async def send_digest(bot: Bot, chat_id: int, city: str = None):
         await bot.pin_chat_message(
             chat_id=chat_id,
             message_id=msg.message_id,
-            disable_notification=True,  # без лишнего звука — сводка уже уведомление
+            disable_notification=True,
         )
         await _set_last_digest_pin(chat_id, msg.message_id)
         logger.info("Сводка закреплена → чат %s", chat_id)
     except Exception as e:
-        # Пин — не критичен: сводка уже доставлена
         logger.warning("Не удалось закрепить сводку: %s", e)
 
 

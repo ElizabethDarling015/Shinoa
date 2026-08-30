@@ -75,33 +75,106 @@ def get_task_categories_keyboard() -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "tasks_menu:today")
 async def cb_tasks_today(call: CallbackQuery):
-    """Показывает только утренние задачи на сегодня (РЕДАКТИРУЕТ сообщение)"""
+    """Показывает утренние задачи на сегодня ОТДЕЛЬНЫМИ сообщениями с кнопками"""
     await call.answer()
-    tasks = await db.get_tasks(call.message.chat.id, task_type="morning")
     
-    if not tasks:
-        text = "📅 На сегодня утренних задач нет. Отличный повод отдохнуть или добавить новую! ☕"
-    else:
-        parts = ["📅 <b>Сегодняшние утренние задачи:</b>\n"]
-        for task in tasks:
-            parts.append(await format_task(task))
-        text = "\n\n".join(parts)
-        text += "\n\n<i>Удалить:</i> <code>/delete</code> <i>&lt;id&gt;</i>"
-
+    # 1. Редактируем исходное сообщение меню, меняем текст и кнопки
+    kb_nav = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⬅️ В категорию", callback_data="start_list"),
+            InlineKeyboardButton(text="🏠 На главную", callback_data="start_main")
+        ]
+    ])
+    
     try:
         await call.message.edit_text(
-            text,
+            "⏳ Отправляю сегодняшние задачи👇",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="⬅️ Назад в задачи", callback_data="start_list"),
-                    InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main")
-                ]
-            ])
+            reply_markup=kb_nav
         )
     except Exception as e:
         if "message is not modified" not in str(e).lower():
-            raise
+            pass  # Игнорируем ошибку, если сообщение уже такое или не редактируется
+
+    # 2. Получаем задачи
+    tasks = await db.get_tasks(call.message.chat.id, task_type="morning")
+    
+    if not tasks:
+        await call.message.answer(
+            "📅 На сегодня утренних задач нет. Отличный повод отдохнуть или добавить новую! ☕",
+            reply_markup=get_close_keyboard()
+        )
+        return
+
+    # 3. Отправляем каждую задачу отдельным сообщением с тремя кнопками
+    for task in tasks:
+        text = await format_task(task)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Выполнено", callback_data=f"task_act:done:{task['id']}"),
+                InlineKeyboardButton(text="❌ Закрыть", callback_data=f"task_act:hide:{task['id']}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"task_act:del:{task['id']}"),
+            ]
+        ])
+        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("task_act:"))
+async def cb_task_action(call: CallbackQuery):
+    """Обработчик кнопок Выполнено / Закрыть / Удалить для утренних задач"""
+    parts = call.data.split(":")
+    action = parts[1]
+    task_id = int(parts[2])
+    chat_id = call.message.chat.id
+
+    if action == "hide":
+        # Кнопка "Закрыть" - просто удаляет сообщение из чата, задача остается в БД
+        await call.answer()
+        try:
+            await call.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось скрыть сообщение: {e}")
+            
+    elif action == "del":
+        # Кнопка "Удалить" - удаляет задачу из БД и сообщение, с Alert
+        task = await db.get_task(task_id)
+        if task and task["chat_id"] == chat_id:
+            schedule_ids = await db.delete_schedules_for_task(task_id)
+            await db.delete_task(task_id, chat_id)
+            if _scheduler:
+                _scheduler.remove_all_for_task(schedule_ids)
+                
+        await call.answer("🗑 Задача удалена навсегда!", show_alert=True)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+
+    elif action == "done":
+        # Кнопка "Выполнено" - перенос в таблицу completed_tasks и удаление из активных
+        task = await db.get_task(task_id)
+        if task and task["chat_id"] == chat_id:
+            from database.connection import get_db
+            async with get_db() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO completed_tasks (original_task_id, chat_id, title, text, category, priority) 
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (task_id, chat_id, task['title'], task.get('text'), task['category'], task['priority'])
+                )
+                await conn.commit()
+            
+            schedule_ids = await db.delete_schedules_for_task(task_id)
+            await db.delete_task(task_id, chat_id)
+            if _scheduler:
+                _scheduler.remove_all_for_task(schedule_ids)
+                
+        await call.answer("✅ Задача выполнена и перенесена в архив!", show_alert=True)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data == "tasks_menu:categories")
@@ -311,3 +384,46 @@ async def cb_close_message(call: CallbackQuery):
         await call.message.delete()
     except Exception as e:
         logger.warning(f"Не удалось удалить сообщение: {e}")
+
+
+# Команды для проверки (Тест-план)
+
+@router.message(Command("test_backup"))
+async def cmd_test_backup(message: Message):
+    """Принудительно отправляет отчет по выполненным задачам за прошлый месяц"""
+    from database.connection import get_db
+    import datetime
+    
+    today = datetime.date.today()
+    first_day_this_month = today.replace(day=1)
+    last_day_last_month = first_day_this_month - datetime.timedelta(days=1)
+    first_day_last_month = last_day_last_month.replace(day=1)
+    
+    sql = """
+        SELECT title, category, priority, completed_at 
+        FROM completed_tasks 
+        WHERE chat_id = ? AND date(completed_at) BETWEEN ? AND ?
+        ORDER BY completed_at ASC
+    """
+    async with get_db() as conn:
+        async with conn.execute(sql, (message.chat.id, first_day_last_month.isoformat(), last_day_last_month.isoformat())) as cur:
+            rows = await cur.fetchall()
+            
+    if not rows:
+        await message.answer(f"📊 <b>Тест бэкапа:</b>\n\nВ прошлом месяце не было выполненных утренних задач.", parse_mode="HTML")
+        return
+        
+    text = f"📊 <b>Тест отчета за {first_day_last_month.strftime('%B %Y')}:</b>\n\n"
+    text += f"✅ Выполнено задач: <b>{len(rows)}</b>\n\n"
+    for r in rows:
+        text += f"• {r['title']} <i>({r['category']})</i>\n"
+        
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("test_expired"))
+async def cmd_test_expired(message: Message):
+    """Принудительно запускает проверку и удаление просроченных morning задач"""
+    from scheduler.digest import process_expired_morning_tasks
+    await process_expired_morning_tasks(message.bot, message.chat.id)
+    await message.answer("✅ Проверка просроченных задач запущена! Проверьте чат на наличие уведомлений.")
