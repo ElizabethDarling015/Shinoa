@@ -594,7 +594,7 @@ def get_morning_result_keyboard() -> InlineKeyboardMarkup:
 
 
 def _morning_time_question(task_text: str, error: str | None = None) -> str:
-    text = "🌅 <b>Задача на завтра утром</b>\n\n"
+    text = "🌅 <b>Задача на завтра</b>\n\n"
     text += f"<i>Что делаем:</i>\n«{escape(_truncate_for_display(task_text))}»\n\n"
     if error:
         text += f"{error}\n\n"
@@ -608,7 +608,7 @@ def _morning_time_question(task_text: str, error: str | None = None) -> str:
 
 def _morning_priority_question(task_text: str, time_str: str) -> str:
     return (
-        "🌅 <b>Задача на завтра утром</b>\n\n"
+        "🌅 <b>Задача на завтра</b>\n\n"
         f"<i>Что делаем:</i> «{escape(_truncate_for_display(task_text))}»\n"
         f"<i>Время напоминания:</i> <b>{escape(time_str)}</b>\n\n"
         "Выберите <b>приоритет</b> напоминания:"
@@ -724,7 +724,7 @@ async def cmd_morning(message: Message, state: FSMContext):
     await state.set_state(NewMorning.text)
 
     bot_msg = await message.answer(
-        "🌅 <b>Задача на завтра утром</b>\n\n"
+        "🌅 <b>Задача на завтра</b>\n\n"
         "Напишу тебе завтра в нужное время и задача исчезнет.\n\n"
         "Что нужно сделать?",
         parse_mode="HTML",

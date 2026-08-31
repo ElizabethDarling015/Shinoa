@@ -7,6 +7,16 @@
 --status-file <путь> и писать туда JSON по контракту (см. service_manager.py,
 раздел "Формат status.json").
 
+Пути (python/entry/cwd) НЕ хардкодятся здесь — берутся из .env. Это важно,
+потому что: (1) абсолютные пути на конкретном сервере не должны лежать в
+публичном гит-репозитории как открытый текст, и (2) один и тот же код гоняется
+на нескольких машинах (например, Mac для разработки + Ubuntu VM в проде) —
+у каждой машины свои пути, а .env как раз для этого и предназначен и уже
+гитигнорится (см. config.py — тот же паттерн, что для BOT_TOKEN).
+
+Если переменная окружения для сервиса не задана — сервис просто не появится
+в меню (см. list_services), вместо падения с FileNotFoundError.
+
 input_kind определяет, что именно спросить у пользователя перед запуском:
     "none"      — без параметров, сразу кнопка "Запустить"
     "url_hours" — сначала ссылка, потом число часов (как у Playerok)
@@ -16,12 +26,14 @@ input_kind определяет, что именно спросить у пол�
 Поле "title" и эмодзи в нём — то, что увидит пользователь на кнопке.
 """
 
+import os
+
 SERVICES = {
     "playerok": {
         "title": "📈 Playerok Parser",
-        "python": "/opt/parsers/playerok_stats/venv/bin/python3",
-        "entry": "/Users/elizabeth/Documents/1.Bot/Shinoa Services/playerok_stats/main.py",
-        "cwd": "/opt/parsers/playerok_stats",
+        "python": os.getenv("PLAYEROK_PYTHON"),
+        "entry": os.getenv("PLAYEROK_ENTRY"),
+        "cwd": os.getenv("PLAYEROK_CWD"),
         "command": "collect",          # подкоманда main.py
         "input_kind": "url_hours",
         "input_prompts": {
@@ -32,12 +44,12 @@ SERVICES = {
             "hours": "⏱ На сколько часов запускаем сбор? Просто число, например <code>6</code>",
         },
     },
-    # Пример будущей записи (Avito) — раскомментировать и donastroit, когда будет готов:
+    # Пример будущей записи (Avito) — раскомментировать и добавить AVITO_* в .env, когда будет готов:
     # "avito": {
     #     "title": "🏷 Avito Parser",
-    #     "python": "/opt/parsers/avito_stats/venv/bin/python3",
-    #     "entry": "/opt/parsers/avito_stats/main.py",
-    #     "cwd": "/opt/parsers/avito_stats",
+    #     "python": os.getenv("AVITO_PYTHON"),
+    #     "entry": os.getenv("AVITO_ENTRY"),
+    #     "cwd": os.getenv("AVITO_CWD"),
     #     "command": "collect",
     #     "input_kind": "url_hours",
     #     "input_prompts": {
@@ -53,5 +65,14 @@ def get_service(service_id: str) -> dict | None:
 
 
 def list_services() -> list[tuple[str, dict]]:
-    """[(service_id, config), ...] в порядке добавления в словарь."""
-    return list(SERVICES.items())
+    """
+    [(service_id, config), ...] в порядке добавления в словарь — но ТОЛЬКО
+    те сервисы, у которых реально заданы все три пути в .env. Если на этой
+    машине .env не настроен под конкретный сервис — он просто не покажется
+    в меню, вместо падения при попытке запуска (см. историю с /opt/parsers/...
+    жёстко зашитым путём, которого не было на другой машине).
+    """
+    return [
+        (sid, cfg) for sid, cfg in SERVICES.items()
+        if cfg.get("python") and cfg.get("entry") and cfg.get("cwd")
+    ]

@@ -4,9 +4,16 @@
 
 from aiogram import Router
 
-from handlers import weekly, monthly, daily, list_tasks, snooze, habits, archive, stats, settings, data_processing, services_control
+from handlers import services_control, weekly, monthly, daily, list_tasks, snooze, habits, archive, stats, settings, data_processing
 
 main_router = Router()
+# services_control — ПЕРВЫМ: его message-хендлеры узко привязаны к конкретному
+# FSM-состоянию (ServiceInput.waiting_url/waiting_hours) и должны выигрывать
+# гонку за голые числа/ссылки у более широких, "глобальных" хендлеров вроде
+# archive.py:@router.message(F.text.regexp(r"^\d+$")) — тот матчит ЛЮБОЕ
+# число без проверки состояния и, стоя раньше в списке, перехватывал ответы
+# на "На сколько часов?" ещё до того, как они доходили до services_control.
+main_router.include_router(services_control.router)
 main_router.include_router(weekly.router)
 main_router.include_router(monthly.router)
 main_router.include_router(daily.router)
@@ -17,7 +24,6 @@ main_router.include_router(archive.router)
 main_router.include_router(stats.router)
 main_router.include_router(settings.router)
 main_router.include_router(data_processing.router)
-main_router.include_router(services_control.router)
 
 
 def set_scheduler(scheduler):

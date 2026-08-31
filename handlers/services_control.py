@@ -1,11 +1,19 @@
 """
 Управление сервисами (Playerok-парсер и любые будущие: Avito, OSINT-тулы и
-т.д.) прямо из Telegram — одна редактируемая карточка на сервис, без спама
-сообщениями. Ввод параметров (ссылка/часы) удаляется сразу после обработки,
-чтобы не засорять чат.
+т.д.) прямо из Telegram. Каждый сервис умеет крутить НЕСКОЛЬКО параллельных
+"потоков" одновременно — у каждого своя мини-карточка (ниша, дата запуска,
+прогресс, пауза/удаление), открывается в том же сообщении.
 
-Список самих сервисов и их запуск/остановка/статус — в services/, этот файл
-не знает специфики ни одного конкретного сервиса, только общий UI-паттерн.
+Важный нюанс Telegram API: если в сообщение уже вложен документ (файл),
+его нельзя превратить обратно в обычное текстовое через editMessageText —
+можно редактировать только ПОДПИСЬ (editMessageCaption). Поэтому все
+карточки умеют жить в двух режимах — как обычное текстовое сообщение (когда
+открыты из меню) и как подпись к файлу (когда открыты из уведомления о
+завершении сбора) — см. параметр as_caption, который тянется через всю
+цепочку функций ниже.
+
+Список самих сервисов и их запуск/пауза/остановка/статус — в services/,
+этот файл не знает специфики ни одного конкретного сервиса.
 """
 
 import logging
@@ -29,8 +37,52 @@ class ServiceInput(StatesGroup):
     waiting_hours = State()
 
 
+FOOTER_DESCRIPTION = (
+    "⚙️ <b>Настройки</b> — параметры этого сервиса (пока нет ни одной)\n"
+    "🧪 <b>Тест</b> — быстрый пробный сбор, ~2 минуты"
+)
+
+
 # ──────────────────────────────────────────────────────────
-# Клавиатуры
+# Универсальное редактирование карточки: текст ИЛИ подпись к файлу
+# ──────────────────────────────────────────────────────────
+
+async def _edit_card(bot, chat_id: int, message_id: int, text: str,
+                      reply_markup: InlineKeyboardMarkup, as_caption: bool):
+    try:
+        if as_caption:
+            await bot.edit_message_caption(
+                chat_id=chat_id, message_id=message_id,
+                caption=text, parse_mode="HTML", reply_markup=reply_markup,
+            )
+        else:
+            await bot.edit_message_text(
+                text, chat_id=chat_id, message_id=message_id,
+                parse_mode="HTML", reply_markup=reply_markup,
+            )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
+def _progress_line(status: dict | None) -> str:
+    """🟡 пока поток только стартует (нет ни одного реального замера), 🟢 как только пришли первые данные."""
+    if not status:
+        return "🟡 Запускается..."
+    percent = status.get("progress_percent")
+    ptext = status.get("progress_text")
+    has_real_progress = (percent not in (None, 0)) or bool(ptext)
+    dot = "🟢" if has_real_progress else "🟡"
+    line = f"{dot} Собирается"
+    if percent is not None:
+        line += f": {percent}%"
+    if ptext:
+        line += f" ({html.escape(str(ptext))})"
+    return line
+
+
+# ──────────────────────────────────────────────────────────
+# Клавиатуры и тексты — главная карточка сервиса (список потоков)
 # ──────────────────────────────────────────────────────────
 
 def get_service_rows() -> list[list[InlineKeyboardButton]]:
@@ -41,19 +93,110 @@ def get_service_rows() -> list[list[InlineKeyboardButton]]:
     return rows
 
 
-def _card_keyboard(service_id: str) -> InlineKeyboardMarkup:
-    running = mgr.is_running(service_id)
-    action_row = (
-        [InlineKeyboardButton(text="⏹ Остановить", callback_data=f"svc_stop:{service_id}")]
-        if running else
-        [InlineKeyboardButton(text="▶️ Запустить", callback_data=f"svc_start:{service_id}")]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=[
-        action_row,
-        [
+def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMarkup:
+    """
+    minimal=True — усечённый набор кнопок для карточки, живущей поверх файла
+    в уведомлении (без Назад/На главную).
+    """
+    run_ids = mgr.list_runs(service_id)
+    rows = []
+
+    if run_ids:
+        for rid in run_ids:
+            rows.append([InlineKeyboardButton(text=f"Поток {rid}", callback_data=f"svc_thread:{service_id}:{rid}")])
+        rows.append([InlineKeyboardButton(text="➕ Добавить поток", callback_data=f"svc_start:{service_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="▶️ Запустить", callback_data=f"svc_start:{service_id}")])
+
+    rows.append([
+        InlineKeyboardButton(text="⚙️ Настройки", callback_data=f"svc_settings:{service_id}"),
+        InlineKeyboardButton(text="🧪 Тест", callback_data=f"svc_test:{service_id}"),
+    ])
+
+    if minimal:
+        rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="svc_close")])
+    else:
+        rows.append([
             InlineKeyboardButton(text="⬅️ Назад", callback_data="start_data"),
             InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
-        ],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _card_text(service_id: str, cfg: dict) -> str:
+    n = len(mgr.list_runs(service_id))
+    body = f"Активных потоков: {n}" if n else "Сейчас не запущен."
+    return f"{cfg['title']}\n\n{body}\n\n{FOOTER_DESCRIPTION}"
+
+
+async def _show_card(message: Message, service_id: str, as_caption: bool = False, minimal: bool = False):
+    cfg = get_service(service_id)
+    if not cfg:
+        await message.answer("❌ Сервис не найден в реестре.")
+        return
+    await _edit_card(
+        message.bot, message.chat.id, message.message_id,
+        _card_text(service_id, cfg), _card_keyboard(service_id, minimal=minimal), as_caption,
+    )
+
+
+# ──────────────────────────────────────────────────────────
+# Клавиатура и текст — карточка конкретного потока
+# ──────────────────────────────────────────────────────────
+
+def _thread_keyboard(service_id: str, run_id: int, minimal: bool = False) -> InlineKeyboardMarkup:
+    paused = mgr.is_paused(service_id, run_id)
+    pause_btn = (
+        InlineKeyboardButton(text="▶️ Старт", callback_data=f"svc_resume:{service_id}:{run_id}")
+        if paused else
+        InlineKeyboardButton(text="⏸ Пауза", callback_data=f"svc_pause:{service_id}:{run_id}")
+    )
+    rows = [
+        [pause_btn, InlineKeyboardButton(text="🗑 Удалить поток", callback_data=f"svc_delete_thread:{service_id}:{run_id}")],
+    ]
+    if minimal:
+        rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="svc_close")])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="⬅️ Назад в категорию", callback_data=f"svc_open:{service_id}"),
+            InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _thread_text(service_id: str, cfg: dict, run_id: int) -> str:
+    if not mgr.is_running(service_id, run_id):
+        return f"{cfg['title']} — Поток {run_id}\n\nЗавершён или не найден."
+
+    params = mgr.get_params(service_id, run_id) or {}
+    url = params.get("url", "—")
+    started_at = (mgr.get_started_at(service_id, run_id) or "")[:16].replace("T", " ")
+    status = mgr.read_status(service_id, run_id)
+    paused_note = "\n⏸ <i>На паузе</i>" if mgr.is_paused(service_id, run_id) else ""
+
+    return (
+        f"{cfg['title']} — Поток {run_id}\n\n"
+        f"Ниша: <code>{html.escape(url)}</code>\n"
+        f"Дата запуска: {html.escape(started_at)} UTC\n"
+        f"Прогресс: {_progress_line(status)}"
+        f"{paused_note}"
+    )
+
+
+async def _show_thread(message: Message, service_id: str, run_id: int, as_caption: bool = False, minimal: bool = False):
+    cfg = get_service(service_id)
+    if not cfg:
+        await message.answer("❌ Сервис не найден в реестре.")
+        return
+    await _edit_card(
+        message.bot, message.chat.id, message.message_id,
+        _thread_text(service_id, cfg, run_id), _thread_keyboard(service_id, run_id, minimal=minimal), as_caption,
+    )
+
+
+def _notification_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="svc_close")],
     ])
 
 
@@ -63,41 +206,8 @@ def _cancel_keyboard(service_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _card_text(service_id: str, cfg: dict) -> str:
-    status = mgr.read_status(service_id)
-    title = cfg["title"]
-
-    if not mgr.is_running(service_id):
-        return f"{title}\n\nСейчас не запущен."
-
-    if not status:
-        return f"{title}\n\n🟡 Запускается..."
-
-    percent = status.get("progress_percent")
-    ptext = status.get("progress_text")
-    line = "🟡 Собирается"
-    if percent is not None:
-        line += f": {percent}%"
-    if ptext:
-        line += f" ({html.escape(str(ptext))})"
-
-    return f"{title}\n\n{line}"
-
-
-async def _show_card(message: Message, service_id: str):
-    cfg = get_service(service_id)
-    if not cfg:
-        await message.edit_text("❌ Сервис не найден в реестре.")
-        return
-    try:
-        await message.edit_text(_card_text(service_id, cfg), reply_markup=_card_keyboard(service_id))
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
-
-
 # ──────────────────────────────────────────────────────────
-# Открытие карточки сервиса
+# Открытие карточек / настройки (заглушка) / закрытие
 # ──────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("svc_open:"))
@@ -108,30 +218,79 @@ async def cb_svc_open(call: CallbackQuery, state: FSMContext):
     await _show_card(call.message, service_id)
 
 
-@router.callback_query(F.data.startswith("svc_stop:"))
-async def cb_svc_stop(call: CallbackQuery):
-    service_id = call.data.split(":", 1)[1]
-    stopped = await mgr.stop(service_id)
-    await call.answer("Остановлено" if stopped else "Уже не запущен")
-    await _show_card(call.message, service_id)
+@router.callback_query(F.data.startswith("svc_thread:"))
+async def cb_svc_thread(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.clear()
+    _, service_id, run_id = call.data.split(":")
+    await _show_thread(call.message, service_id, int(run_id), as_caption=bool(call.message.document))
+
+
+@router.callback_query(F.data.startswith("svc_pause:"))
+async def cb_svc_pause(call: CallbackQuery):
+    _, service_id, run_id = call.data.split(":")
+    ok = mgr.pause(service_id, int(run_id))
+    await call.answer("На паузе" if ok else "Не удалось поставить на паузу")
+    await _show_thread(call.message, service_id, int(run_id), as_caption=bool(call.message.document))
+
+
+@router.callback_query(F.data.startswith("svc_resume:"))
+async def cb_svc_resume(call: CallbackQuery):
+    _, service_id, run_id = call.data.split(":")
+    ok = mgr.resume(service_id, int(run_id))
+    await call.answer("Продолжаю" if ok else "Не удалось возобновить")
+    await _show_thread(call.message, service_id, int(run_id), as_caption=bool(call.message.document))
+
+
+@router.callback_query(F.data.startswith("svc_delete_thread:"))
+async def cb_svc_delete_thread(call: CallbackQuery):
+    _, service_id, run_id = call.data.split(":")
+    await mgr.stop(service_id, int(run_id))
+    await call.answer("Поток удалён")
+    # потока больше нет — возвращаемся на главную карточку сервиса
+    await _show_card(call.message, service_id, as_caption=bool(call.message.document))
+
+
+@router.callback_query(F.data == "svc_close")
+async def cb_svc_close(call: CallbackQuery):
+    """Удаляет ТОЛЬКО сообщение в Telegram. Файл на диске сервера это никак не трогает —
+    это два независимых места хранения, удаление сообщения никогда не трогает исходник."""
+    await call.answer()
+    try:
+        await call.message.delete()
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith("svc_settings:"))
+async def cb_svc_settings(call: CallbackQuery):
+    """Заглушка — конкретных настроек пока нет ни у одного сервиса."""
+    await call.answer("🚧 У этого сервиса пока нет настроек", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("svc_cancel_input:"))
 async def cb_svc_cancel_input(call: CallbackQuery, state: FSMContext):
     """
-    Кнопка 'Отмена' у ЛЮБОЙ карточки восстанавливает ИМЕННО эту карточку по
-    service_id, зашитому прямо в callback_data — не полагается на общее
-    FSM-состояние чата, которое могло уже "уехать" на другой запуск/карточку.
+    Кнопка 'Отмена' восстанавливает ИМЕННО карточку сервиса (не конкретного
+    потока — на этапе ввода параметров поток ещё не создан) по service_id,
+    зашитому прямо в callback_data — не полагается на общее FSM-состояние.
     """
     service_id = call.data.split(":", 1)[1]
     await state.clear()
     await call.answer("Отменено")
-    await _show_card(call.message, service_id)
+    as_caption = bool(call.message.document)
+    await _show_card(call.message, service_id, as_caption=as_caption, minimal=as_caption)
 
 
 # ──────────────────────────────────────────────────────────
-# Запуск сервиса — FSM-ввод параметров (пока поддержан input_kind=url_hours)
+# Запуск потока — FSM-ввод параметров (пока поддержан input_kind=url_hours)
 # ──────────────────────────────────────────────────────────
+
+def _invalid_input_text(original_prompt: str) -> str:
+    """Единый формат ошибки ввода — заголовок + повтор исходного вопроса, чтобы
+    сразу было видно, что именно ожидалось, не листая историю сообщений."""
+    return f"❌ <b>Некорректные данные!</b>\n\n{original_prompt}"
+
 
 def _is_command(message: Message) -> bool:
     """Команды (/start, /help и т.п.) не должны 'застревать' в наших FSM-хендлерах —
@@ -139,35 +298,47 @@ def _is_command(message: Message) -> bool:
     return bool(message.text and message.text.startswith("/"))
 
 
-@router.callback_query(F.data.startswith("svc_start:"))
-async def cb_svc_start(call: CallbackQuery, state: FSMContext):
-    await state.clear()  # на случай, если чат был в каком-то другом "зависшем" состоянии
-    service_id = call.data.split(":", 1)[1]
+async def _begin_input_flow(call: CallbackQuery, state: FSMContext, service_id: str, test_mode: bool):
+    await state.clear()
     cfg = get_service(service_id)
     if not cfg:
         await call.answer("Сервис не найден", show_alert=True)
         return
-    if mgr.is_running(service_id):
-        await call.answer("Уже запущен", show_alert=True)
-        return
 
     await call.answer()
     input_kind = cfg.get("input_kind", "none")
+    as_caption = bool(call.message.document)
 
     if input_kind == "none":
-        await _launch(call.message.bot, call.message.chat.id, call.message.message_id, service_id, {})
+        params = {"test": True} if test_mode else {}
+        await _launch(call.message.bot, call.message.chat.id, call.message.message_id, service_id, params, as_caption)
         return
 
     if input_kind != "url_hours":
-        # заготовка под text/number — пока не реализовано конкретно, но не падаем
         await call.answer("Этот тип ввода пока не поддержан в интерфейсе", show_alert=True)
         return
 
     await state.set_state(ServiceInput.waiting_url)
-    await state.update_data(service_id=service_id, card_chat_id=call.message.chat.id, card_msg_id=call.message.message_id)
+    await state.update_data(
+        service_id=service_id, test_mode=test_mode, as_caption=as_caption,
+        card_chat_id=call.message.chat.id, card_msg_id=call.message.message_id,
+    )
 
     prompt = cfg["input_prompts"]["url"]
-    await call.message.edit_text(prompt, parse_mode="HTML", reply_markup=_cancel_keyboard(service_id))
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      prompt, _cancel_keyboard(service_id), as_caption)
+
+
+@router.callback_query(F.data.startswith("svc_start:"))
+async def cb_svc_start(call: CallbackQuery, state: FSMContext):
+    service_id = call.data.split(":", 1)[1]
+    await _begin_input_flow(call, state, service_id, test_mode=False)
+
+
+@router.callback_query(F.data.startswith("svc_test:"))
+async def cb_svc_test(call: CallbackQuery, state: FSMContext):
+    service_id = call.data.split(":", 1)[1]
+    await _begin_input_flow(call, state, service_id, test_mode=True)
 
 
 @router.message(ServiceInput.waiting_url, lambda m: not _is_command(m))
@@ -175,6 +346,8 @@ async def step_waiting_url(message: Message, state: FSMContext):
     url = message.text.strip() if message.text else ""
     data = await state.get_data()
     service_id = data["service_id"]
+    test_mode = data.get("test_mode", False)
+    as_caption = data.get("as_caption", False)
     cfg = get_service(service_id)
 
     try:
@@ -183,28 +356,32 @@ async def step_waiting_url(message: Message, state: FSMContext):
         pass
 
     if not url.startswith("http"):
-        await message.bot.edit_message_text(
-            "❌ Это не похоже на ссылку. Пришли ссылку целиком, начиная с https://",
-            chat_id=data["card_chat_id"], message_id=data["card_msg_id"],
-            reply_markup=_cancel_keyboard(service_id),
+        await _edit_card(
+            message.bot, data["card_chat_id"], data["card_msg_id"],
+            _invalid_input_text(cfg["input_prompts"]["url"]),
+            _cancel_keyboard(service_id), as_caption,
         )
+        return
+
+    if test_mode:
+        await state.clear()
+        await _launch(message.bot, data["card_chat_id"], data["card_msg_id"], service_id,
+                      {"url": url, "test": True}, as_caption)
         return
 
     await state.update_data(url=url)
     await state.set_state(ServiceInput.waiting_hours)
 
     prompt = cfg["input_prompts"]["hours"]
-    await message.bot.edit_message_text(
-        prompt, parse_mode="HTML",
-        chat_id=data["card_chat_id"], message_id=data["card_msg_id"],
-        reply_markup=_cancel_keyboard(service_id),
-    )
+    await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"], prompt, _cancel_keyboard(service_id), as_caption)
 
 
 @router.message(ServiceInput.waiting_hours, lambda m: not _is_command(m))
 async def step_waiting_hours(message: Message, state: FSMContext):
     data = await state.get_data()
     service_id = data["service_id"]
+    as_caption = data.get("as_caption", False)
+    cfg = get_service(service_id)
     raw = message.text.strip() if message.text else ""
 
     try:
@@ -217,77 +394,75 @@ async def step_waiting_hours(message: Message, state: FSMContext):
         if hours <= 0:
             raise ValueError
     except ValueError:
-        await message.bot.edit_message_text(
-            "❌ Нужно положительное число часов, например 6",
-            chat_id=data["card_chat_id"], message_id=data["card_msg_id"],
-            reply_markup=_cancel_keyboard(service_id),
+        await _edit_card(
+            message.bot, data["card_chat_id"], data["card_msg_id"],
+            _invalid_input_text(cfg["input_prompts"]["hours"]),
+            _cancel_keyboard(service_id), as_caption,
         )
         return
 
     params = {"url": data["url"], "hours": hours}
     await state.clear()
 
-    await _launch(message.bot, data["card_chat_id"], data["card_msg_id"], service_id, params)
+    await _launch(message.bot, data["card_chat_id"], data["card_msg_id"], service_id, params, as_caption)
 
 
 # ──────────────────────────────────────────────────────────
-# Запуск + подписка на live-обновления карточки
+# Запуск + подписка на live-обновления карточки потока
 # ──────────────────────────────────────────────────────────
 
-async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: dict):
+async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: dict, as_caption: bool = False):
     cfg = get_service(service_id)
 
-    async def on_update(status: dict):
+    async def on_update(run_id: int, status: dict):
         st = status.get("status")
         try:
             if st == "running":
-                percent = status.get("progress_percent")
-                ptext = status.get("progress_text")
-                line = "🟡 Собирается"
-                if percent is not None:
-                    line += f": {percent}%"
-                if ptext:
-                    line += f" ({html.escape(str(ptext))})"
-                await bot.edit_message_text(
-                    f"{cfg['title']}\n\n{line}",
-                    chat_id=chat_id, message_id=message_id,
-                    reply_markup=_card_keyboard(service_id),
-                )
-            elif st == "done":
+                await _edit_card(bot, chat_id, message_id, _thread_text(service_id, cfg, run_id),
+                                  _thread_keyboard(service_id, run_id, minimal=as_caption), as_caption)
+                return
+
+            if st == "done":
                 summary = status.get("result_text") or "Готово, без сводки."
-                await bot.send_message(chat_id, f"✅ <b>{cfg['title']}</b> — готово\n\n{summary}", parse_mode="HTML")
                 result_file = status.get("result_file")
+                caption = f"✅ <b>{cfg['title']}</b> — Поток {run_id} готов\n\n{summary}"
                 if result_file:
                     try:
                         from aiogram.types import FSInputFile
-                        await bot.send_document(chat_id, FSInputFile(result_file))
+                        await bot.send_document(
+                            chat_id, FSInputFile(result_file), caption=caption, parse_mode="HTML",
+                            reply_markup=_notification_keyboard(),
+                        )
                     except Exception as e:
-                        logger.warning("Не удалось отправить файл результата: %s", e)
-                await bot.edit_message_text(
-                    _card_text(service_id, cfg), chat_id=chat_id, message_id=message_id,
-                    reply_markup=_card_keyboard(service_id),
-                )
+                        logger.warning("Не удалось отправить файл результата (%s): %s", result_file, e)
+                        await bot.send_message(
+                            chat_id,
+                            f"{caption}\n\n⚠️ Файл не отправился в чат.\n"
+                            f"Путь на сервере: <code>{html.escape(str(result_file))}</code>\n"
+                            f"Причина: <code>{html.escape(str(e))}</code>",
+                            parse_mode="HTML",
+                        )
+                else:
+                    await bot.send_message(chat_id, caption, parse_mode="HTML")
             elif st == "error":
                 err = status.get("error") or "неизвестная ошибка"
-                await bot.send_message(chat_id, f"❌ <b>{cfg['title']}</b> — ошибка\n\n<code>{html.escape(err)}</code>", parse_mode="HTML")
-                await bot.edit_message_text(
-                    _card_text(service_id, cfg), chat_id=chat_id, message_id=message_id,
-                    reply_markup=_card_keyboard(service_id),
+                await bot.send_message(
+                    chat_id, f"❌ <b>{cfg['title']}</b> — Поток {run_id} — ошибка\n\n<code>{html.escape(err)}</code>",
+                    parse_mode="HTML",
                 )
+
+            # поток исчез (done/error) — возвращаем ИСХОДНУЮ карточку (главную для сервиса)
+            await _edit_card(bot, chat_id, message_id, _card_text(service_id, cfg),
+                              _card_keyboard(service_id, minimal=as_caption), as_caption)
         except TelegramBadRequest as e:
             if "message is not modified" not in str(e).lower():
-                logger.warning("Ошибка обновления карточки сервиса %s: %s", service_id, e)
+                logger.warning("Ошибка обновления карточки сервиса %s (поток %s): %s", service_id, run_id, e)
 
     try:
-        await mgr.start(service_id, params, on_update=on_update)
+        run_id = await mgr.start(service_id, params, on_update=on_update)
     except mgr.ServiceError as e:
-        await bot.edit_message_text(
-            f"❌ {e}", chat_id=chat_id, message_id=message_id,
-            reply_markup=_card_keyboard(service_id),
-        )
+        await _edit_card(bot, chat_id, message_id, f"❌ {e}", _card_keyboard(service_id, minimal=as_caption), as_caption)
         return
 
-    await bot.edit_message_text(
-        f"{cfg['title']}\n\n🟡 Запускается...", chat_id=chat_id, message_id=message_id,
-        reply_markup=_card_keyboard(service_id),
-    )
+    await _edit_card(bot, chat_id, message_id, _thread_text(service_id, cfg, run_id),
+                      _thread_keyboard(service_id, run_id, minimal=as_caption), as_caption)
