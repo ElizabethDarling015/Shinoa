@@ -20,11 +20,9 @@ router = Router()
 
 _scheduler = None
 
-
 def set_scheduler(scheduler):
     global _scheduler
     _scheduler = scheduler
-
 
 # ──────────────────────────────────────────────────────────
 # ✅ Выполнено
@@ -39,12 +37,38 @@ async def cb_done(call: CallbackQuery):
         await call.answer("Задача не найдена.", show_alert=True)
         return
 
-    await db.complete_task(task_id, call.message.chat.id)
+    if task["type"] == "morning":
+        # НОВАЯ ЛОГИКА: morning-задача уходит в архив выполненных
+        # (таблица completed_tasks — из неё собирается ежемесячный отчёт)
+        from database.connection import get_db
+        async with get_db() as conn:
+            await conn.execute(
+                """
+                INSERT INTO completed_tasks
+                    (original_task_id, chat_id, title, text, category, priority)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    call.message.chat.id,
+                    task["title"],
+                    task.get("text"),
+                    task["category"],
+                    task["priority"],
+                ),
+            )
+            await conn.commit()
 
-    # Удаляем из планировщика все расписания задачи
-    schedules = await db.get_schedules(task_id)
-    if _scheduler:
-        _scheduler.remove_all_for_task([s["id"] for s in schedules])
+        schedule_ids = await db.delete_schedules_for_task(task_id)
+        await db.delete_task(task_id, call.message.chat.id)
+        if _scheduler:
+            _scheduler.remove_all_for_task(schedule_ids)
+    else:
+        # Старая логика для постоянных задач (daily/weekly/monthly)
+        await db.complete_task(task_id, call.message.chat.id)
+        schedules = await db.get_schedules(task_id)
+        if _scheduler:
+            _scheduler.remove_all_for_task([s["id"] for s in schedules])
 
     await call.message.edit_text(
         call.message.text + "\n\n✅ <b>Выполнено!</b>",
@@ -52,7 +76,6 @@ async def cb_done(call: CallbackQuery):
         reply_markup=None,
     )
     await call.answer("Отлично! Задача выполнена 💪")
-
 
 # ──────────────────────────────────────────────────────────
 # ⏰ Меню откладывания
@@ -65,7 +88,6 @@ async def cb_snooze_menu(call: CallbackQuery):
         reply_markup=snooze_keyboard(int(task_id), int(schedule_id))
     )
     await call.answer()
-
 
 # ──────────────────────────────────────────────────────────
 # ⏰ Выбор времени откладывания
@@ -124,7 +146,6 @@ async def cb_snooze(call: CallbackQuery):
     )
     await call.answer(f"Напомню {label}")
 
-
 # ──────────────────────────────────────────────────────────
 # ❌ Удалить задачу
 # ──────────────────────────────────────────────────────────
@@ -151,7 +172,6 @@ async def cb_delete_task(call: CallbackQuery):
         reply_markup=None,
     )
     await call.answer("Задача удалена.")
-
 
 # ──────────────────────────────────────────────────────────
 # ✅ Отметить привычку выполненной
