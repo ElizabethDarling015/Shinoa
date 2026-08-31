@@ -57,9 +57,9 @@ def _card_keyboard(service_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _cancel_keyboard() -> InlineKeyboardMarkup:
+def _cancel_keyboard(service_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="svc_cancel_input")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"svc_cancel_input:{service_id}")],
     ])
 
 
@@ -116,22 +116,32 @@ async def cb_svc_stop(call: CallbackQuery):
     await _show_card(call.message, service_id)
 
 
-@router.callback_query(F.data == "svc_cancel_input")
+@router.callback_query(F.data.startswith("svc_cancel_input:"))
 async def cb_svc_cancel_input(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    service_id = data.get("service_id")
+    """
+    Кнопка 'Отмена' у ЛЮБОЙ карточки восстанавливает ИМЕННО эту карточку по
+    service_id, зашитому прямо в callback_data — не полагается на общее
+    FSM-состояние чата, которое могло уже "уехать" на другой запуск/карточку.
+    """
+    service_id = call.data.split(":", 1)[1]
     await state.clear()
     await call.answer("Отменено")
-    if service_id:
-        await _show_card(call.message, service_id)
+    await _show_card(call.message, service_id)
 
 
 # ──────────────────────────────────────────────────────────
 # Запуск сервиса — FSM-ввод параметров (пока поддержан input_kind=url_hours)
 # ──────────────────────────────────────────────────────────
 
+def _is_command(message: Message) -> bool:
+    """Команды (/start, /help и т.п.) не должны 'застревать' в наших FSM-хендлерах —
+    пропускаем их дальше, к настоящим обработчикам этих команд."""
+    return bool(message.text and message.text.startswith("/"))
+
+
 @router.callback_query(F.data.startswith("svc_start:"))
 async def cb_svc_start(call: CallbackQuery, state: FSMContext):
+    await state.clear()  # на случай, если чат был в каком-то другом "зависшем" состоянии
     service_id = call.data.split(":", 1)[1]
     cfg = get_service(service_id)
     if not cfg:
@@ -157,10 +167,10 @@ async def cb_svc_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(service_id=service_id, card_chat_id=call.message.chat.id, card_msg_id=call.message.message_id)
 
     prompt = cfg["input_prompts"]["url"]
-    await call.message.edit_text(prompt, parse_mode="HTML", reply_markup=_cancel_keyboard())
+    await call.message.edit_text(prompt, parse_mode="HTML", reply_markup=_cancel_keyboard(service_id))
 
 
-@router.message(ServiceInput.waiting_url)
+@router.message(ServiceInput.waiting_url, lambda m: not _is_command(m))
 async def step_waiting_url(message: Message, state: FSMContext):
     url = message.text.strip() if message.text else ""
     data = await state.get_data()
@@ -176,7 +186,7 @@ async def step_waiting_url(message: Message, state: FSMContext):
         await message.bot.edit_message_text(
             "❌ Это не похоже на ссылку. Пришли ссылку целиком, начиная с https://",
             chat_id=data["card_chat_id"], message_id=data["card_msg_id"],
-            reply_markup=_cancel_keyboard(),
+            reply_markup=_cancel_keyboard(service_id),
         )
         return
 
@@ -187,11 +197,11 @@ async def step_waiting_url(message: Message, state: FSMContext):
     await message.bot.edit_message_text(
         prompt, parse_mode="HTML",
         chat_id=data["card_chat_id"], message_id=data["card_msg_id"],
-        reply_markup=_cancel_keyboard(),
+        reply_markup=_cancel_keyboard(service_id),
     )
 
 
-@router.message(ServiceInput.waiting_hours)
+@router.message(ServiceInput.waiting_hours, lambda m: not _is_command(m))
 async def step_waiting_hours(message: Message, state: FSMContext):
     data = await state.get_data()
     service_id = data["service_id"]
@@ -210,7 +220,7 @@ async def step_waiting_hours(message: Message, state: FSMContext):
         await message.bot.edit_message_text(
             "❌ Нужно положительное число часов, например 6",
             chat_id=data["card_chat_id"], message_id=data["card_msg_id"],
-            reply_markup=_cancel_keyboard(),
+            reply_markup=_cancel_keyboard(service_id),
         )
         return
 
