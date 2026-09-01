@@ -44,6 +44,34 @@ FOOTER_DESCRIPTION = (
 
 
 # ──────────────────────────────────────────────────────────
+# Трекер "куда сейчас смотрит пользователь" — какое (service_id, run_id)
+# сейчас отрисовано в конкретном сообщении (chat_id, message_id).
+#
+# Зачем: у нас всего ОДНО живое сообщение, которое переиспользуется (редактируется
+# in-place) для всех экранов бота. Автообновление прогресса потока (см. _launch/
+# on_update) должно трогать это сообщение ТОЛЬКО пока пользователь реально смотрит
+# на карточку именно этого потока — иначе два эффекта: (1) периодический апдейт
+# перебивает совершенно другое меню, в которое пользователь тем временем перешёл;
+# (2) при нескольких параллельных потоках они начинают затирать прогресс друг
+# друга в одном и том же сообщении, потому что оба слепо редактируют один message_id.
+# ──────────────────────────────────────────────────────────
+
+_view_state: dict[tuple[int, int], tuple] = {}
+
+
+def _set_view(chat_id: int, message_id: int, view: tuple) -> None:
+    _view_state[(chat_id, message_id)] = view
+
+
+def _clear_view(chat_id: int, message_id: int) -> None:
+    _view_state.pop((chat_id, message_id), None)
+
+
+def _is_viewing_thread(chat_id: int, message_id: int, service_id: str, run_id: int) -> bool:
+    return _view_state.get((chat_id, message_id)) == ("thread", service_id, run_id)
+
+
+# ──────────────────────────────────────────────────────────
 # Универсальное редактирование карточки: текст ИЛИ подпись к файлу
 # ──────────────────────────────────────────────────────────
 
@@ -65,20 +93,76 @@ async def _edit_card(bot, chat_id: int, message_id: int, text: str,
             raise
 
 
+def _has_real_progress(status: dict | None) -> bool:
+    if not status:
+        return False
+    percent = status.get("progress_percent")
+    ptext = status.get("progress_text")
+    return (percent not in (None, 0)) or bool(ptext)
+
+
+def _status_dot(status: dict | None, paused: bool) -> str:
+    """⏸ на паузе, 🟡 пока нет ни одного реального замера, 🟢 как только пришли первые данные."""
+    if paused:
+        return "⏸"
+    return "🟢" if _has_real_progress(status) else "🟡"
+
+
 def _progress_line(status: dict | None) -> str:
-    """🟡 пока поток только стартует (нет ни одного реального замера), 🟢 как только пришли первые данные."""
+    dot = "🟡" if not status else ("🟢" if _has_real_progress(status) else "🟡")
     if not status:
         return "🟡 Запускается..."
     percent = status.get("progress_percent")
     ptext = status.get("progress_text")
-    has_real_progress = (percent not in (None, 0)) or bool(ptext)
-    dot = "🟢" if has_real_progress else "🟡"
     line = f"{dot} Собирается"
     if percent is not None:
         line += f": {percent}%"
     if ptext:
         line += f" ({html.escape(str(ptext))})"
     return line
+
+
+def _fmt_duration(seconds) -> str | None:
+    """Компактный формат длительности: '3ч20м', '3ч', '45м'. None, если данных нет."""
+    if seconds is None:
+        return None
+    try:
+        seconds = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return None
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    if hours >= 1:
+        return f"{hours}ч{minutes:02d}м" if minutes else f"{hours}ч"
+    return f"{minutes}м" if minutes else "<1м"
+
+
+def _thread_label(service_id: str, run_id: int) -> str:
+    """
+    Однострочная метка потока для кнопки в списке — вместо голого 'Поток N':
+    'Roblox - Аккаунты 🟢 (3ч/12ч)' или 'Adobe - Подписки 🟡 (test)'.
+    Название ниши берём из status.json (niche_title, резолвится парсером через
+    GraphQL) — это реальное название игры/категории, а не то, что мы можем
+    надёжно угадать по URL на стороне Shinoa. Пока парсер его ещё не прислал
+    (самое начало сбора) — временно показываем саму ссылку.
+    """
+    params = mgr.get_params(service_id, run_id) or {}
+    status = mgr.read_status(service_id, run_id)
+    paused = mgr.is_paused(service_id, run_id)
+
+    title = (status or {}).get("niche_title") or params.get("url") or f"поток {run_id}"
+    dot = _status_dot(status, paused)
+
+    if params.get("test"):
+        suffix = "test"
+    else:
+        remaining = _fmt_duration((status or {}).get("remaining_seconds"))
+        total = _fmt_duration((status or {}).get("total_seconds"))
+        suffix = f"{remaining}/{total}" if remaining and total else None
+
+    # Кнопки в Telegram — plain text, HTML не парсится, поэтому без html.escape.
+    label = f"{title} {dot}"
+    return f"{label} ({suffix})" if suffix else label
 
 
 # ──────────────────────────────────────────────────────────
@@ -103,7 +187,7 @@ def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMark
 
     if run_ids:
         for rid in run_ids:
-            rows.append([InlineKeyboardButton(text=f"Поток {rid}", callback_data=f"svc_thread:{service_id}:{rid}")])
+            rows.append([InlineKeyboardButton(text=_thread_label(service_id, rid), callback_data=f"svc_thread:{service_id}:{rid}")])
         rows.append([InlineKeyboardButton(text="➕ Добавить поток", callback_data=f"svc_start:{service_id}")])
     else:
         rows.append([InlineKeyboardButton(text="▶️ Запустить", callback_data=f"svc_start:{service_id}")])
@@ -134,6 +218,7 @@ async def _show_card(message: Message, service_id: str, as_caption: bool = False
     if not cfg:
         await message.answer("❌ Сервис не найден в реестре.")
         return
+    _set_view(message.chat.id, message.message_id, ("card", service_id))
     await _edit_card(
         message.bot, message.chat.id, message.message_id,
         _card_text(service_id, cfg), _card_keyboard(service_id, minimal=minimal), as_caption,
@@ -166,7 +251,7 @@ def _thread_keyboard(service_id: str, run_id: int, minimal: bool = False) -> Inl
 
 def _thread_text(service_id: str, cfg: dict, run_id: int) -> str:
     if not mgr.is_running(service_id, run_id):
-        return f"{cfg['title']} — Поток {run_id}\n\nЗавершён или не найден."
+        return f"{cfg['title']} — поток {run_id}\n\nЗавершён или не найден."
 
     params = mgr.get_params(service_id, run_id) or {}
     url = params.get("url", "—")
@@ -174,13 +259,23 @@ def _thread_text(service_id: str, cfg: dict, run_id: int) -> str:
     status = mgr.read_status(service_id, run_id)
     paused_note = "\n⏸ <i>На паузе</i>" if mgr.is_paused(service_id, run_id) else ""
 
-    return (
-        f"{cfg['title']} — Поток {run_id}\n\n"
-        f"Ниша: <code>{html.escape(url)}</code>\n"
-        f"Дата запуска: {html.escape(started_at)} UTC\n"
-        f"Прогресс: {_progress_line(status)}"
-        f"{paused_note}"
-    )
+    title = (status or {}).get("niche_title") or url
+    lines = [
+        f"{cfg['title']} — {html.escape(str(title))}",
+        "",
+        f"Ниша: <code>{html.escape(url)}</code>",
+        f"Дата запуска: {html.escape(started_at)} UTC",
+        f"Прогресс: {_progress_line(status)}",
+    ]
+    if params.get("test"):
+        lines.append("Режим: тест (~2 мин)")
+    else:
+        remaining = _fmt_duration((status or {}).get("remaining_seconds"))
+        total = _fmt_duration((status or {}).get("total_seconds"))
+        if remaining and total:
+            lines.append(f"Осталось: {remaining} из {total}")
+
+    return "\n".join(lines) + paused_note
 
 
 async def _show_thread(message: Message, service_id: str, run_id: int, as_caption: bool = False, minimal: bool = False):
@@ -188,6 +283,7 @@ async def _show_thread(message: Message, service_id: str, run_id: int, as_captio
     if not cfg:
         await message.answer("❌ Сервис не найден в реестре.")
         return
+    _set_view(message.chat.id, message.message_id, ("thread", service_id, run_id))
     await _edit_card(
         message.bot, message.chat.id, message.message_id,
         _thread_text(service_id, cfg, run_id), _thread_keyboard(service_id, run_id, minimal=minimal), as_caption,
@@ -256,6 +352,7 @@ async def cb_svc_close(call: CallbackQuery):
     """Удаляет ТОЛЬКО сообщение в Telegram. Файл на диске сервера это никак не трогает —
     это два независимых места хранения, удаление сообщения никогда не трогает исходник."""
     await call.answer()
+    _clear_view(call.message.chat.id, call.message.message_id)
     try:
         await call.message.delete()
     except TelegramBadRequest:
@@ -324,6 +421,10 @@ async def _begin_input_flow(call: CallbackQuery, state: FSMContext, service_id: 
         card_chat_id=call.message.chat.id, card_msg_id=call.message.message_id,
     )
 
+    # Экран ввода параметров — не карточка и не поток, чтобы автообновление
+    # прогресса ДРУГОГО, уже бегущего потока не затёрло этот промпт.
+    _set_view(call.message.chat.id, call.message.message_id, ("input", service_id))
+
     prompt = cfg["input_prompts"]["url"]
     await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
                       prompt, _cancel_keyboard(service_id), as_caption)
@@ -371,6 +472,7 @@ async def step_waiting_url(message: Message, state: FSMContext):
 
     await state.update_data(url=url)
     await state.set_state(ServiceInput.waiting_hours)
+    _set_view(data["card_chat_id"], data["card_msg_id"], ("input", service_id))
 
     prompt = cfg["input_prompts"]["hours"]
     await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"], prompt, _cancel_keyboard(service_id), as_caption)
@@ -411,6 +513,12 @@ async def step_waiting_hours(message: Message, state: FSMContext):
 # Запуск + подписка на live-обновления карточки потока
 # ──────────────────────────────────────────────────────────
 
+def _run_title(service_id: str, run_id: int, status: dict, cfg: dict) -> str:
+    """Название для уведомлений (done/error) — из status.json, иначе ссылка, иначе заголовок сервиса."""
+    params = mgr.get_params(service_id, run_id) or {}
+    return status.get("niche_title") or params.get("url") or cfg["title"]
+
+
 async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: dict, as_caption: bool = False):
     cfg = get_service(service_id)
 
@@ -418,14 +526,22 @@ async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: d
         st = status.get("status")
         try:
             if st == "running":
-                await _edit_card(bot, chat_id, message_id, _thread_text(service_id, cfg, run_id),
-                                  _thread_keyboard(service_id, run_id, minimal=as_caption), as_caption)
+                # Живое обновление % прогресса — ТОЛЬКО если это самое сообщение прямо
+                # сейчас показывает карточку именно этого потока. Если пользователь
+                # ушёл в другое меню или смотрит на другой поток — ничего не трогаем,
+                # экран увидит актуальное состояние сам, при следующем открытии этой
+                # карточки (см. _show_thread — оно всегда читает status свежим).
+                if _is_viewing_thread(chat_id, message_id, service_id, run_id):
+                    await _edit_card(bot, chat_id, message_id, _thread_text(service_id, cfg, run_id),
+                                      _thread_keyboard(service_id, run_id, minimal=as_caption), as_caption)
                 return
+
+            title = _run_title(service_id, run_id, status, cfg)
 
             if st == "done":
                 summary = status.get("result_text") or "Готово, без сводки."
                 result_file = status.get("result_file")
-                caption = f"✅ <b>{cfg['title']}</b> — Поток {run_id} готов\n\n{summary}"
+                caption = f"✅ <b>{cfg['title']}</b> — {html.escape(str(title))} готово\n\n{summary}"
                 if result_file:
                     try:
                         from aiogram.types import FSInputFile
@@ -447,13 +563,19 @@ async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: d
             elif st == "error":
                 err = status.get("error") or "неизвестная ошибка"
                 await bot.send_message(
-                    chat_id, f"❌ <b>{cfg['title']}</b> — Поток {run_id} — ошибка\n\n<code>{html.escape(err)}</code>",
+                    chat_id, f"❌ <b>{cfg['title']}</b> — {html.escape(str(title))} — ошибка\n\n<code>{html.escape(err)}</code>",
                     parse_mode="HTML",
                 )
 
-            # поток исчез (done/error) — возвращаем ИСХОДНУЮ карточку (главную для сервиса)
-            await _edit_card(bot, chat_id, message_id, _card_text(service_id, cfg),
-                              _card_keyboard(service_id, minimal=as_caption), as_caption)
+            # Поток завершился (done/error). Карточку сервиса в этом сообщении
+            # возвращаем ТОЛЬКО если пользователь прямо сейчас смотрел именно на
+            # карточку этого потока (она стала неактуальной — поток пропал). Если
+            # он смотрит на что-то другое, это сообщение не трогаем вообще —
+            # отдельное уведомление выше он уже получил.
+            if _is_viewing_thread(chat_id, message_id, service_id, run_id):
+                _set_view(chat_id, message_id, ("card", service_id))
+                await _edit_card(bot, chat_id, message_id, _card_text(service_id, cfg),
+                                  _card_keyboard(service_id, minimal=as_caption), as_caption)
         except TelegramBadRequest as e:
             if "message is not modified" not in str(e).lower():
                 logger.warning("Ошибка обновления карточки сервиса %s (поток %s): %s", service_id, run_id, e)
@@ -464,5 +586,9 @@ async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: d
         await _edit_card(bot, chat_id, message_id, f"❌ {e}", _card_keyboard(service_id, minimal=as_caption), as_caption)
         return
 
+    # Сразу после запуска это сообщение показывает карточку нового потока —
+    # регистрируем это в трекере, иначе первое же периодическое обновление
+    # прогресса будет молча проигнорировано как "пользователь не смотрит".
+    _set_view(chat_id, message_id, ("thread", service_id, run_id))
     await _edit_card(bot, chat_id, message_id, _thread_text(service_id, cfg, run_id),
                       _thread_keyboard(service_id, run_id, minimal=as_caption), as_caption)

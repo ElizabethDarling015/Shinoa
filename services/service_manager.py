@@ -10,11 +10,19 @@
     "started_at": "ISO-время",
     "progress_percent": 0-100 или null,
     "progress_text": "3 из 10" или null — для сервисов без чёткого % прогресса,
+    "niche_title": "человекочитаемое имя того, что обрабатывается" или null —
+                    например "Roblox - Аккаунты"; используется в UI вместо
+                    голого номера потока (см. handlers/services_control.py),
+    "elapsed_seconds" / "remaining_seconds" / "total_seconds": числа или null —
+                    для отображения "осталось X из Y" в карточке потока,
     "last_update": "ISO-время",
     "result_text": "краткая сводка метрик для уведомления" или null,
     "result_file": "путь к файлу-результату" или null,
     "error": "текст ошибки" или null
 }
+Ни одно из новых полей не обязательно — сервис, который их не пишет, просто
+не получит красивую метку/таймер в UI (см. подстраховки через .get(...) и
+"or" в services_control.py), само управление им (старт/пауза/стоп) не пострадает.
 
 Несколько параллельных запусков ("потоков") на один и тот же service_id —
 штатный режим, каждый со своим run_id (целое число, растёт по порядку
@@ -87,6 +95,11 @@ def get_started_at(service_id: str, run_id: int) -> str | None:
     return entry["started_at"] if entry else None
 
 
+def get_log_file(service_id: str, run_id: int) -> Path | None:
+    entry = _runs(service_id).get(run_id)
+    return entry["log_file"] if entry else None
+
+
 def read_status(service_id: str, run_id: int) -> dict | None:
     entry = _runs(service_id).get(run_id)
     if not entry:
@@ -134,13 +147,19 @@ async def start(service_id: str, params: dict, on_update=None, poll_seconds: flo
     run_id = _next_run_id.get(service_id, 1)
     _next_run_id[service_id] = run_id + 1
 
-    status_file = STATUS_DIR / f"{service_id}_{run_id}_{int(time.time())}.json"
+    stamp = int(time.time())
+    status_file = STATUS_DIR / f"{service_id}_{run_id}_{stamp}.json"
+    log_file = STATUS_DIR / f"{service_id}_{run_id}_{stamp}.log"
     started_at = datetime.now(timezone.utc).isoformat()
     status_file.write_text(json.dumps({
         "status": "running",
         "started_at": started_at,
         "progress_percent": 0,
         "progress_text": None,
+        "niche_title": None,
+        "elapsed_seconds": None,
+        "remaining_seconds": None,
+        "total_seconds": None,
         "last_update": started_at,
         "result_text": None,
         "result_file": None,
@@ -150,11 +169,15 @@ async def start(service_id: str, params: dict, on_update=None, poll_seconds: flo
     cmd = _build_command(cfg, params, status_file)
     logger.info("Запускаю сервис %s (поток #%d): %s", service_id, run_id, " ".join(cmd))
 
+    # Вывод (stdout/stderr) дочернего процесса пишем в .log рядом со status.json,
+    # а не глушим в DEVNULL — иначе при зависании/падении без внятного "error"
+    # в status.json диагностировать причину было бы невозможно.
+    log_fh = open(log_file, "wb")
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cfg.get("cwd"),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=asyncio.subprocess.STDOUT,
     )
 
     watcher_task = asyncio.create_task(
@@ -163,6 +186,8 @@ async def start(service_id: str, params: dict, on_update=None, poll_seconds: flo
     _runs(service_id)[run_id] = {
         "process": process,
         "status_file": status_file,
+        "log_file": log_file,
+        "log_fh": log_fh,
         "watcher_task": watcher_task,
         "params": params,
         "started_at": started_at,
@@ -211,7 +236,12 @@ async def _watch(service_id: str, run_id: int, status_file: Path, process, on_up
         wait_task.cancel()
         raise
     finally:
-        _runs(service_id).pop(run_id, None)
+        entry = _runs(service_id).pop(run_id, None)
+        if entry and entry.get("log_fh"):
+            try:
+                entry["log_fh"].close()
+            except OSError:
+                pass
 
 
 async def stop(service_id: str, run_id: int) -> bool:
@@ -236,6 +266,11 @@ async def stop(service_id: str, run_id: int) -> bool:
             process.kill()
     watcher_task.cancel()
     _runs(service_id).pop(run_id, None)
+    if entry.get("log_fh"):
+        try:
+            entry["log_fh"].close()
+        except OSError:
+            pass
     return True
 
 

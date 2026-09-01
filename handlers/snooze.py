@@ -39,7 +39,6 @@ async def cb_done(call: CallbackQuery):
 
     if task["type"] == "morning":
         # НОВАЯ ЛОГИКА: morning-задача уходит в архив выполненных
-        # (таблица completed_tasks — из неё собирается ежемесячный отчёт)
         from database.connection import get_db
         async with get_db() as conn:
             await conn.execute(
@@ -70,11 +69,17 @@ async def cb_done(call: CallbackQuery):
         if _scheduler:
             _scheduler.remove_all_for_task([s["id"] for s in schedules])
 
-    await call.message.edit_text(
-        call.message.text + "\n\n✅ <b>Выполнено!</b>",
-        parse_mode="HTML",
-        reply_markup=None,
-    )
+    # Удаляем сообщение напоминания из чата
+    try:
+        await call.message.delete()
+    except Exception as e:
+        logger.warning("Не удалось удалить сообщение напоминания: %s", e)
+        # Фолбэк: если удалить нельзя (сообщение старше 48ч) — оставляем короткую пометку
+        try:
+            await call.message.edit_text("✅ <b>Выполнено!</b>", parse_mode="HTML", reply_markup=None)
+        except Exception:
+            pass
+
     await call.answer("Отлично! Задача выполнена 💪")
 
 # ──────────────────────────────────────────────────────────
