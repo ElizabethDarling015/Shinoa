@@ -19,6 +19,7 @@
 import asyncio
 import logging
 import html
+import os
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -44,10 +45,10 @@ class ServiceSettingsInput(StatesGroup):
 
 def _footer_description(cfg: dict) -> str:
     if cfg.get("settings"):
-        settings_line = "⚙️ <b>Настройки</b> — прокси/куки и другие параметры для новых потоков"
+        settings_line = "⚙️ <b>Настройки</b> — Дополнительные параметры для новых потоков."
     else:
         settings_line = "⚙️ <b>Настройки</b> — параметры этого сервиса (пока нет ни одной)"
-    return f"{settings_line}\n🧪 <b>Тест</b> — быстрый пробный сбор, ~2 минуты"
+    return f"{settings_line}\n🧪 <b>Тест</b> — Быстрый сбор за 2 минуты."
 
 
 # ──────────────────────────────────────────────────────────
@@ -256,20 +257,70 @@ def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _run_settings_lines(service_id: str, run_id: int, cfg: dict) -> list:
+    """
+    Строки "эмодзи Метка: значение" — что реально применено К ЭТОМУ КОНКРЕТНОМУ
+    потоку. Читаем не текущие настройки сервиса, а именно ЗАФИКСИРОВАННУЮ
+    командную строку этого запуска (mgr.get_cmd) — потому что настройки могли
+    поменять уже ПОСЛЕ его старта, у разных потоков одного сервиса они вполне
+    могут отличаться, и показывать нужно то, что реально используется этим
+    потоком, а не то, что стоит в настройках прямо сейчас.
+
+    Секретные значения (куки) в чат не выводим — только само имя файла,
+    которого достаточно, чтобы понять, использует ли этот поток кастомную
+    сессию и делят ли несколько потоков одну и ту же (одинаковое имя файла).
+    Прокси не секретен в этом смысле (это просто IP/VPN пользователя) —
+    показываем как есть.
+    """
+    fields = cfg.get("settings", [])
+    if not fields:
+        return []
+    cmd = mgr.get_cmd(service_id, run_id) or []
+    lines = []
+    for field in fields:
+        raw = None
+        if field["cli_flag"] in cmd:
+            idx = cmd.index(field["cli_flag"])
+            if idx + 1 < len(cmd):
+                raw = cmd[idx + 1]
+        if raw is None:
+            value_str = "по умолчанию"
+        elif field.get("is_file_content"):
+            value_str = f"свои ({html.escape(os.path.basename(raw))})"
+        else:
+            value_str = html.escape(raw)
+        lines.append(f"{field['label']}: {value_str}")
+    return lines
+
+
 def _card_text(service_id: str, cfg: dict) -> str:
     run_ids = _visible_runs(service_id)
     if run_ids:
-        lines = []
-        for rid in run_ids:
+        blocks = []
+        for i, rid in enumerate(run_ids, start=1):
             params = mgr.get_params(service_id, rid) or {}
             status = mgr.read_status(service_id, rid)
             paused = mgr.is_paused(service_id, rid)
             dot = _status_dot(status, paused)
             url = params.get("url", "—")
+            title = (status or {}).get("niche_title") or url
+
             percent = (status or {}).get("progress_percent")
             percent_str = f"{percent}%" if percent is not None else "0%"
-            lines.append(f"{dot} <code>{html.escape(url)}</code> — {percent_str}")
-        body = "\n".join(lines)
+
+            elapsed = _fmt_duration((status or {}).get("elapsed_seconds"))
+            remaining = _fmt_duration((status or {}).get("remaining_seconds"))
+            if params.get("test"):
+                time_str = "тест"
+            elif elapsed and remaining:
+                time_str = f"{elapsed} прошло / {remaining} осталось"
+            else:
+                time_str = "старт"
+
+            head = f"{dot} {i}. {html.escape(str(title))}. ({time_str}). {percent_str}"
+            block_lines = [head] + _run_settings_lines(service_id, rid, cfg) + [f"<code>{html.escape(url)}</code>"]
+            blocks.append("\n".join(block_lines))
+        body = "\n\n".join(blocks)
     else:
         body = "Сейчас не запущен."
     return f"{cfg['title']}\n\n{body}\n\n{_footer_description(cfg)}"

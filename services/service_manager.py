@@ -202,6 +202,16 @@ def get_log_file(service_id: str, run_id: int) -> Path | None:
     return entry["log_file"] if entry else None
 
 
+def get_cmd(service_id: str, run_id: int) -> list | None:
+    """Полная командная строка, которой был реально запущен этот поток —
+    зафиксирована один раз при старте (start()), не меняется, даже если
+    настройки сервиса (прокси/куки) поменяли уже ПОСЛЕ его запуска. Нужно,
+    чтобы UI мог показать, какие именно куки/прокси применены к КОНКРЕТНОМУ
+    потоку (у разных потоков одного сервиса они могут отличаться)."""
+    entry = _runs(service_id).get(run_id)
+    return entry["cmd"] if entry else None
+
+
 def _read_status_file(status_file: Path) -> dict | None:
     try:
         return json.loads(status_file.read_text(encoding="utf-8"))
