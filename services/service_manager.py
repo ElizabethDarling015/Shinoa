@@ -216,7 +216,35 @@ def read_status(service_id: str, run_id: int) -> dict | None:
     return _read_status_file(entry["status_file"])
 
 
-def _build_command(cfg: dict, params: dict, status_file: Path) -> list[str]:
+def _settings_file(service_id: str) -> Path:
+    return STATUS_DIR / f"{service_id}_settings.json"
+
+
+def get_settings(service_id: str) -> dict:
+    """Текущие сохранённые значения настроек сервиса ({key: value}), или {} если ничего не задано."""
+    f = _settings_file(service_id)
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def set_setting(service_id: str, key: str, value: str | None) -> None:
+    """value=None убирает настройку (возврат к поведению по умолчанию у сервиса)."""
+    settings = get_settings(service_id)
+    if value is None:
+        settings.pop(key, None)
+    else:
+        settings[key] = value
+    f = _settings_file(service_id)
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(settings, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(f)
+
+
+def _build_command(service_id: str, cfg: dict, params: dict, status_file: Path) -> list[str]:
     """Собирает командную строку запуска под конкретный сервис из реестра + параметры пользователя."""
     cmd = [cfg["python"], cfg["entry"], cfg["command"]]
 
@@ -233,6 +261,17 @@ def _build_command(cfg: dict, params: dict, status_file: Path) -> list[str]:
     # "none" — без доп. параметров
 
     cmd += ["--status-file", str(status_file)]
+
+    # Настройки сервиса (прокси/куки и т.п., см. service_registry.py) —
+    # общие для всех НОВЫХ потоков этого сервиса, пока не поменяешь ещё раз
+    # через "⚙️ Настройки". Пункты, для которых ничего не задано, просто не
+    # добавляют флаг — сервис получит своё поведение по умолчанию.
+    settings = get_settings(service_id)
+    for field in cfg.get("settings", []):
+        value = settings.get(field["key"])
+        if value:
+            cmd += [field["cli_flag"], value]
+
     return cmd
 
 
@@ -314,7 +353,7 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
         "error": None,
     }), encoding="utf-8")
 
-    cmd = _build_command(cfg, params, status_file)
+    cmd = _build_command(service_id, cfg, params, status_file)
     logger.info("Запускаю сервис %s (поток #%d): %s", service_id, run_id, " ".join(cmd))
 
     # Вывод (stdout/stderr) дочернего процесса пишем в .log рядом со status.json,
@@ -427,7 +466,7 @@ async def _watch(service_id: str, run_id: int, status_file: Path, pid: int, on_u
         _dump_registry()
 
 
-async def stop(service_id: str, run_id: int) -> bool:
+async def stop(service_id: str, run_id: int) -> dict | None:
     """
     Досрочно останавливает поток — но НЕ значит "тихо оборвать и выбросить
     данные". Парсер на SIGTERM (см. main.py, _sigterm_to_keyboard_interrupt)
@@ -435,19 +474,23 @@ async def stop(service_id: str, run_id: int) -> bool:
     успел, дозачищает очередь кандидатов и честно формирует HTML-отчёт по
     уже собранным данным — то есть status.json в итоге получает нормальный
     "done" с результатом, как при обычном истечении времени сбора, просто
-    раньше срока. Раньше stop() эту "done"-запись игнорировал — ждал только
-    смерти pid и молча выкидывал watcher-задачу, ничего не доставив
-    пользователю. Теперь дожидаемся и этого финального статуса и доставляем
-    его через тот же on_update, что и обычное завершение — та же карточка
-    файла/сводки, что при полном сборе, просто "досрочно".
+    раньше срока.
+
+    В отличие от прошлой версии, САМ результат сюда не доставляет (не зовёт
+    on_update) — только возвращает финальный status-словарь вызывающей
+    стороне, чтобы та решила, как именно его показать (например, отредактировать
+    заранее отправленное "результат придёт сюда же" сообщение — см.
+    services_control.cb_svc_delete_thread). Возвращает None, если собственный
+    watcher потока успел сам доставить результат обычным путём (через
+    on_update), пока мы ждали здесь смерти процесса — тогда досылать/дорисовывать
+    нечего, всё уже случилось штатно.
     """
     entry = _runs(service_id).get(run_id)
     if not entry:
-        return False
+        return None
     pid = entry["pid"]
     local_process = entry.get("local_process")
     watcher_task = entry["watcher_task"]
-    on_update = entry.get("on_update")
     status_file = entry["status_file"]
 
     if _is_pid_alive(pid, local_process):
@@ -474,8 +517,8 @@ async def stop(service_id: str, run_id: int) -> bool:
                 # Собственный watcher потока успел сам заметить финальный
                 # status.json (у него параллельно идёт свой опрос) и уже
                 # доставил результат обычным путём, пока мы тут ждали —
-                # досылать второй раз не нужно.
-                return True
+                # нашего вмешательства больше не нужно.
+                return None
             await asyncio.sleep(0.5)
         else:
             try:
@@ -487,7 +530,7 @@ async def stop(service_id: str, run_id: int) -> bool:
             await asyncio.sleep(0.3)
 
     if run_id not in _runs(service_id):
-        return True  # см. комментарий выше — watcher уже сам всё доставил
+        return None  # см. комментарий выше — watcher уже сам всё доставил
 
     watcher_task.cancel()
     try:
@@ -496,16 +539,14 @@ async def stop(service_id: str, run_id: int) -> bool:
         pass
 
     final = _read_status_file(status_file)
-    if on_update:
-        if final and final.get("status") in ("done", "error"):
-            await on_update(run_id, final)
-        else:
-            # Процесс умер (в т.ч. по нашему SIGKILL после таймаута), не
-            # оставив финального статуса — не молчим об этом.
-            await on_update(run_id, {
-                "status": "error",
-                "error": "Поток остановлен принудительно, финальный статус не был записан",
-            })
+    if not final or final.get("status") not in ("done", "error"):
+        # Процесс умер (в т.ч. по нашему SIGKILL после таймаута), не
+        # оставив финального статуса — не молчим об этом, отдаём вызывающей
+        # стороне синтетическую ошибку вместо пустоты.
+        final = {
+            "status": "error",
+            "error": "Поток остановлен принудительно, финальный статус не был записан",
+        }
 
     _runs(service_id).pop(run_id, None)
     if entry.get("log_fh"):
@@ -514,7 +555,7 @@ async def stop(service_id: str, run_id: int) -> bool:
         except OSError:
             pass
     _dump_registry()
-    return True
+    return final
 
 
 def pause(service_id: str, run_id: int) -> bool:

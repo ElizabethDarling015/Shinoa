@@ -89,8 +89,7 @@ def _find_thread_viewer(service_id: str, run_id: int) -> tuple[int, int, bool] |
 
 
 _background_tasks: set = set()
-
-
+_hiding_runs: set = set()  # (service_id, run_id) — досрочно скрытые из списка на время остановки, см. _visible_runs
 def _fire_and_forget(coro) -> None:
     """
     Создаёт фоновую asyncio-задачу и, в отличие от голого asyncio.create_task(),
@@ -216,12 +215,23 @@ def get_service_rows() -> list[list[InlineKeyboardButton]]:
     return rows
 
 
+def _visible_runs(service_id: str) -> list:
+    """
+    Как mgr.list_runs(), но без потоков, которые прямо сейчас останавливаются
+    (см. cb_svc_delete_thread/_hiding_runs). Фактическая остановка (SIGTERM →
+    дозачистка → отчёт) занимает до минуты, но с точки зрения списка поток
+    должен пропасть из него сразу по нажатию "Удалить поток" — ждать нечего,
+    результат придёт отдельным сообщением, когда реально будет готов.
+    """
+    return [rid for rid in mgr.list_runs(service_id) if (service_id, rid) not in _hiding_runs]
+
+
 def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMarkup:
     """
     minimal=True — усечённый набор кнопок для карточки, живущей поверх файла
     в уведомлении (без Назад/На главную).
     """
-    run_ids = mgr.list_runs(service_id)
+    run_ids = _visible_runs(service_id)
     rows = []
 
     if run_ids:
@@ -247,7 +257,7 @@ def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMark
 
 
 def _card_text(service_id: str, cfg: dict) -> str:
-    run_ids = mgr.list_runs(service_id)
+    run_ids = _visible_runs(service_id)
     if run_ids:
         lines = []
         for rid in run_ids:
@@ -392,32 +402,65 @@ async def cb_svc_resume(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("svc_delete_thread:"))
 async def cb_svc_delete_thread(call: CallbackQuery):
+    """
+    Удаление потока — это не мгновенная операция (парсер ещё должен
+    дозачистить данные и сформировать отчёт по уже собранному, до минуты),
+    поэтому здесь два независимых сообщения, а не одно:
+
+    1. Карточка, на которой нажали "Удалить поток" (call.message), СРАЗУ
+       возвращается к списку потоков сервиса — минус этот поток. Она
+       никогда не показывает "Останавливаю...": с точки зрения списка
+       поток уже снят, ждать тут нечего.
+    2. Отдельное НОВОЕ сообщение — "результат придёт сюда же" — и именно
+       ОНО, то же самое сообщение, чуть позже редактируется в финальный
+       результат (файл/сводка или ошибка), когда парсер реально закончит.
+       Не блокируем этим обработчик нажатия — mgr.stop() может занять
+       до ~минуты (см. её докстринг) — досчитываем в фоне.
+    """
     _, service_id, run_id = call.data.split(":")
     run_id = int(run_id)
+    cfg = get_service(service_id)
     as_caption = bool(call.message.document)
     await call.answer("Останавливаю поток…")
 
-    # mgr.stop() может занять до ~минуты (см. комментарий в service_manager.py —
-    # даём парсеру время на graceful-стоп: дозачистка кандидатов + отчёт по уже
-    # собранному). Не блокируем этим обработчик нажатия — иначе кнопка будет
-    # выглядеть "зависшей". Показываем промежуточный статус и досчитываем в фоне.
-    # Пока идёт остановка (до минуты), это сообщение временно ничего не
-    # "показывает" в терминах трекера — иначе периодический on_update этого же
-    # ещё-живого-пока-останавливается потока перезатрёт наш статус "⏳ Останавливаю...".
-    _clear_view(call.message.chat.id, call.message.message_id)
-    await _edit_card(
-        call.message.bot, call.message.chat.id, call.message.message_id,
-        "⏳ Останавливаю поток — парсер дозачищает данные и формирует отчёт "
-        "по уже собранному, результат придёт как обычное уведомление с файлом, "
-        "это может занять до минуты...",
-        InlineKeyboardMarkup(inline_keyboard=[]), as_caption,
+    # Прячем из списка СРАЗУ (см. _visible_runs) — фактическая остановка
+    # (SIGTERM → дозачистка → отчёт) может занять до минуты, но ждать этого,
+    # чтобы поток пропал из списка, не нужно — с точки зрения пользователя
+    # он уже "удалён", результат придёт отдельным сообщением позже.
+    _hiding_runs.add((service_id, run_id))
+
+    # 1. Список потоков — сразу к обычному виду, без промежуточных состояний.
+    await _show_card(call.message, service_id, as_caption=as_caption)
+
+    # 2. Отдельный плейсхолдер, который позже сам превратится в результат.
+    placeholder = await call.message.bot.send_message(
+        call.message.chat.id,
+        f"⏳ <b>{cfg['title'] if cfg else service_id}</b> — поток остановлен, "
+        "парсер дозачищает данные и формирует отчёт по уже собранному — "
+        "результат придёт сюда же, это может занять до минуты...",
+        parse_mode="HTML",
     )
 
-    async def _stop_and_refresh():
-        await mgr.stop(service_id, run_id)
-        await _show_card(call.message, service_id, as_caption=as_caption)
+    async def _stop_and_deliver():
+        try:
+            final = await mgr.stop(service_id, run_id)
+        finally:
+            _hiding_runs.discard((service_id, run_id))
+        if final is None:
+            # Собственный watcher потока успел сам доставить результат
+            # обычным путём (новым сообщением), пока мы ждали, — этот
+            # плейсхолдер больше не нужен, не оставляем его висеть вечным "⏳".
+            try:
+                await placeholder.delete()
+            except TelegramBadRequest:
+                pass
+            return
+        if not cfg:
+            return
+        await _deliver_result_by_edit(call.message.bot, placeholder.chat.id, placeholder.message_id,
+                                       service_id, run_id, cfg, final)
 
-    _fire_and_forget(_stop_and_refresh())
+    _fire_and_forget(_stop_and_deliver())
 
 
 @router.callback_query(F.data == "svc_close")
@@ -682,6 +725,62 @@ def _run_title(service_id: str, run_id: int, status: dict, cfg: dict) -> str:
     return status.get("niche_title") or params.get("url") or cfg["title"]
 
 
+def _final_result_caption(cfg: dict, title: str, status: dict) -> tuple[str, str | None]:
+    """
+    Строит готовый HTML-текст итогового уведомления из финального status-словаря
+    (done/error) — общий для ОБОИХ способов доставки: обычного (новое
+    сообщение, см. _build_on_update) и через редактирование заранее отправленного
+    "результат придёт сюда же" плейсхолдера (см. _deliver_result_by_edit,
+    используется при досрочной остановке потока). Возвращает (текст, путь_к_файлу
+    или None — файл есть только у "done", да и то не всегда).
+    """
+    if status.get("status") == "done":
+        summary = status.get("result_text") or "Готово, без сводки."
+        text = f"✅ <b>{cfg['title']}</b> — {html.escape(str(title))} готово\n\n{summary}"
+        return text, status.get("result_file")
+    err = status.get("error") or "неизвестная ошибка"
+    text = f"❌ <b>{cfg['title']}</b> — {html.escape(str(title))} — ошибка\n\n<code>{html.escape(err)}</code>"
+    return text, None
+
+
+async def _deliver_result_by_edit(bot, chat_id: int, message_id: int, service_id: str, run_id: int,
+                                   cfg: dict, status: dict) -> None:
+    """
+    Доставляет финальный результат (done/error) РЕДАКТИРУЯ уже существующее
+    сообщение (плейсхолдер "результат придёт сюда же", отправленный при
+    досрочной остановке потока — см. cb_svc_delete_thread) вместо отправки
+    нового. Если есть файл — переводим сообщение из текстового в
+    документ-с-подписью через edit_message_media (Telegram это разрешает:
+    единственное направление редактирования, которое НЕЛЬЗЯ — обратное,
+    убрать уже прикреплённый файл через edit_message_text, см. комментарий
+    в шапке файла про as_caption).
+    """
+    title = _run_title(service_id, run_id, status, cfg)
+    text, result_file = _final_result_caption(cfg, title, status)
+
+    if result_file:
+        try:
+            from aiogram.types import FSInputFile, InputMediaDocument
+            await bot.edit_message_media(
+                chat_id=chat_id, message_id=message_id,
+                media=InputMediaDocument(media=FSInputFile(result_file), caption=text, parse_mode="HTML"),
+                reply_markup=_notification_keyboard(),
+            )
+            return
+        except Exception as e:
+            logger.warning("Не удалось прикрепить файл через edit_message_media (%s): %s", result_file, e)
+            text = (f"{text}\n\n⚠️ Файл не отправился в чат.\n"
+                    f"Путь на сервере: <code>{html.escape(str(result_file))}</code>\n"
+                    f"Причина: <code>{html.escape(str(e))}</code>")
+
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="HTML",
+                                     reply_markup=_notification_keyboard(), disable_web_page_preview=True)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            logger.warning("Не удалось отредактировать плейсхолдер результата: %s", e)
+
+
 def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
     """
     Строит колбэк on_update(run_id, status), который менеджер сервисов дёргает
@@ -717,39 +816,29 @@ def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
                 return
 
             title = _run_title(service_id, run_id, status, cfg)
+            text, result_file = _final_result_caption(cfg, title, status)
 
-            if st == "done":
-                summary = status.get("result_text") or "Готово, без сводки."
-                result_file = status.get("result_file")
-                caption = f"✅ <b>{cfg['title']}</b> — {html.escape(str(title))} готово\n\n{summary}"
-                if result_file:
-                    try:
-                        from aiogram.types import FSInputFile
-                        await bot.send_document(
-                            chat_id, FSInputFile(result_file), caption=caption, parse_mode="HTML",
-                            reply_markup=_notification_keyboard(),
-                        )
-                    except Exception as e:
-                        logger.warning("Не удалось отправить файл результата (%s): %s", result_file, e)
-                        await bot.send_message(
-                            chat_id,
-                            f"{caption}\n\n⚠️ Файл не отправился в чат.\n"
-                            f"Путь на сервере: <code>{html.escape(str(result_file))}</code>\n"
-                            f"Причина: <code>{html.escape(str(e))}</code>",
-                            parse_mode="HTML", reply_markup=_notification_keyboard(),
-                            disable_web_page_preview=True,
-                        )
-                else:
-                    await bot.send_message(chat_id, caption, parse_mode="HTML",
-                                            reply_markup=_notification_keyboard(),
-                                            disable_web_page_preview=True)
-            elif st == "error":
-                err = status.get("error") or "неизвестная ошибка"
-                await bot.send_message(
-                    chat_id, f"❌ <b>{cfg['title']}</b> — {html.escape(str(title))} — ошибка\n\n<code>{html.escape(err)}</code>",
-                    parse_mode="HTML", reply_markup=_notification_keyboard(),
-                    disable_web_page_preview=True,
-                )
+            if result_file:
+                try:
+                    from aiogram.types import FSInputFile
+                    await bot.send_document(
+                        chat_id, FSInputFile(result_file), caption=text, parse_mode="HTML",
+                        reply_markup=_notification_keyboard(),
+                    )
+                except Exception as e:
+                    logger.warning("Не удалось отправить файл результата (%s): %s", result_file, e)
+                    await bot.send_message(
+                        chat_id,
+                        f"{text}\n\n⚠️ Файл не отправился в чат.\n"
+                        f"Путь на сервере: <code>{html.escape(str(result_file))}</code>\n"
+                        f"Причина: <code>{html.escape(str(e))}</code>",
+                        parse_mode="HTML", reply_markup=_notification_keyboard(),
+                        disable_web_page_preview=True,
+                    )
+            else:
+                await bot.send_message(chat_id, text, parse_mode="HTML",
+                                        reply_markup=_notification_keyboard(),
+                                        disable_web_page_preview=True)
 
             # Поток завершился (done/error). Карточку, которая его показывала,
             # возвращаем к главной карточке сервиса — если, конечно, кто-то её
