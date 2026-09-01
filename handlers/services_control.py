@@ -98,6 +98,7 @@ async def _edit_card(bot, chat_id: int, message_id: int, text: str,
             await bot.edit_message_text(
                 text, chat_id=chat_id, message_id=message_id,
                 parse_mode="HTML", reply_markup=reply_markup,
+                disable_web_page_preview=True,  # ниша даётся ссылкой в <code> — превью сайта тут не нужно, это дублирует и раздувает карточку
             )
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e).lower():
@@ -219,8 +220,21 @@ def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMark
 
 
 def _card_text(service_id: str, cfg: dict) -> str:
-    n = len(mgr.list_runs(service_id))
-    body = f"Активных потоков: {n}" if n else "Сейчас не запущен."
+    run_ids = mgr.list_runs(service_id)
+    if run_ids:
+        lines = []
+        for rid in run_ids:
+            params = mgr.get_params(service_id, rid) or {}
+            status = mgr.read_status(service_id, rid)
+            paused = mgr.is_paused(service_id, rid)
+            dot = _status_dot(status, paused)
+            url = params.get("url", "—")
+            percent = (status or {}).get("progress_percent")
+            percent_str = f"{percent}%" if percent is not None else "0%"
+            lines.append(f"{dot} <code>{html.escape(url)}</code> — {percent_str}")
+        body = "\n".join(lines)
+    else:
+        body = "Сейчас не запущен."
     return f"{cfg['title']}\n\n{body}\n\n{FOOTER_DESCRIPTION}"
 
 
@@ -367,7 +381,8 @@ async def cb_svc_delete_thread(call: CallbackQuery):
     await _edit_card(
         call.message.bot, call.message.chat.id, call.message.message_id,
         "⏳ Останавливаю поток — парсер дозачищает данные и формирует отчёт "
-        "по уже собранному, это может занять до минуты...",
+        "по уже собранному, результат придёт как обычное уведомление с файлом, "
+        "это может занять до минуты...",
         InlineKeyboardMarkup(inline_keyboard=[]), as_caption,
     )
 
@@ -604,15 +619,19 @@ def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
                             f"{caption}\n\n⚠️ Файл не отправился в чат.\n"
                             f"Путь на сервере: <code>{html.escape(str(result_file))}</code>\n"
                             f"Причина: <code>{html.escape(str(e))}</code>",
-                            parse_mode="HTML",
+                            parse_mode="HTML", reply_markup=_notification_keyboard(),
+                            disable_web_page_preview=True,
                         )
                 else:
-                    await bot.send_message(chat_id, caption, parse_mode="HTML")
+                    await bot.send_message(chat_id, caption, parse_mode="HTML",
+                                            reply_markup=_notification_keyboard(),
+                                            disable_web_page_preview=True)
             elif st == "error":
                 err = status.get("error") or "неизвестная ошибка"
                 await bot.send_message(
                     chat_id, f"❌ <b>{cfg['title']}</b> — {html.escape(str(title))} — ошибка\n\n<code>{html.escape(err)}</code>",
-                    parse_mode="HTML",
+                    parse_mode="HTML", reply_markup=_notification_keyboard(),
+                    disable_web_page_preview=True,
                 )
 
             # Поток завершился (done/error). Карточку, которая его показывала,

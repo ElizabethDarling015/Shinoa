@@ -347,6 +347,7 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
         "log_fh": log_fh,
         "cmd": cmd,
         "chat_id": chat_id,
+        "on_update": on_update,  # нужен stop()'у для досрочной доставки результата, см. stop()
         "watcher_task": watcher_task,
         "params": params,
         "started_at": started_at,
@@ -427,13 +428,28 @@ async def _watch(service_id: str, run_id: int, status_file: Path, pid: int, on_u
 
 
 async def stop(service_id: str, run_id: int) -> bool:
-    """Полностью убивает и удаляет поток (не путать с pause — эта операция необратима)."""
+    """
+    Досрочно останавливает поток — но НЕ значит "тихо оборвать и выбросить
+    данные". Парсер на SIGTERM (см. main.py, _sigterm_to_keyboard_interrupt)
+    уходит в тот же graceful-путь, что и ручной Ctrl+C: досчитывает то, что
+    успел, дозачищает очередь кандидатов и честно формирует HTML-отчёт по
+    уже собранным данным — то есть status.json в итоге получает нормальный
+    "done" с результатом, как при обычном истечении времени сбора, просто
+    раньше срока. Раньше stop() эту "done"-запись игнорировал — ждал только
+    смерти pid и молча выкидывал watcher-задачу, ничего не доставив
+    пользователю. Теперь дожидаемся и этого финального статуса и доставляем
+    его через тот же on_update, что и обычное завершение — та же карточка
+    файла/сводки, что при полном сборе, просто "досрочно".
+    """
     entry = _runs(service_id).get(run_id)
     if not entry:
         return False
     pid = entry["pid"]
     local_process = entry.get("local_process")
     watcher_task = entry["watcher_task"]
+    on_update = entry.get("on_update")
+    status_file = entry["status_file"]
+
     if _is_pid_alive(pid, local_process):
         if entry.get("paused"):
             # замороженный SIGSTOP-ом процесс не реагирует на SIGTERM,
@@ -447,21 +463,50 @@ async def stop(service_id: str, run_id: int) -> bool:
         except ProcessLookupError:
             pass
         # Ждём мягкого завершения ощутимо дольше, чем раньше: после SIGTERM
-        # парсер (см. main.py, _sigterm_to_keyboard_interrupt) уходит в тот же
-        # graceful-путь, что и ручной Ctrl+C — а там ещё "дозачистка" очереди
+        # парсер уходит в graceful-путь — а там ещё "дозачистка" очереди
         # кандидатов на "продано" (до MAX_DRAIN_CANDIDATES_AT_END=30 штук по
         # ~1 сек каждая) и генерация HTML-отчёта. 10 секунд было мало —
         # убивали SIGKILL'ом прямо посреди этого, отчёт не успевал сформироваться.
-        for _ in range(120):  # ~60 секунд
+        for _ in range(120):  # ~60 секунд, проверяем каждые 0.5 сек
             if not _is_pid_alive(pid, local_process):
                 break
+            if run_id not in _runs(service_id):
+                # Собственный watcher потока успел сам заметить финальный
+                # status.json (у него параллельно идёт свой опрос) и уже
+                # доставил результат обычным путём, пока мы тут ждали —
+                # досылать второй раз не нужно.
+                return True
             await asyncio.sleep(0.5)
         else:
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            # Даём крошечный шанс — если SIGKILL прервал ровно в момент
+            # дозаписи status.json, пусть файл на диске успеет закрыться.
+            await asyncio.sleep(0.3)
+
+    if run_id not in _runs(service_id):
+        return True  # см. комментарий выше — watcher уже сам всё доставил
+
     watcher_task.cancel()
+    try:
+        await watcher_task
+    except asyncio.CancelledError:
+        pass
+
+    final = _read_status_file(status_file)
+    if on_update:
+        if final and final.get("status") in ("done", "error"):
+            await on_update(run_id, final)
+        else:
+            # Процесс умер (в т.ч. по нашему SIGKILL после таймаута), не
+            # оставив финального статуса — не молчим об этом.
+            await on_update(run_id, {
+                "status": "error",
+                "error": "Поток остановлен принудительно, финальный статус не был записан",
+            })
+
     _runs(service_id).pop(run_id, None)
     if entry.get("log_fh"):
         try:
@@ -541,6 +586,7 @@ async def recover(on_update_factory) -> list[tuple[str, int, str]]:
                 "log_fh": None,  # не наш дескриптор — процесс пишет в него сам
                 "cmd": cmd,
                 "chat_id": entry["chat_id"],
+                "on_update": on_update,
                 "watcher_task": watcher_task,
                 "params": entry["params"],
                 "started_at": entry["started_at"],
