@@ -238,6 +238,17 @@ async def main():
     from handlers.start import register_start
     register_start(dp)
 
+    # ──────────────────────────────────────────
+    # Восстановление сервисных потоков (парсер и т.п.), переживших этот
+    # рестарт бота — см. services/service_manager.py (recover) и
+    # handlers/services_control.py (recover_services) для подробностей.
+    # ──────────────────────────────────────────
+    try:
+        from handlers.services_control import recover_services
+        await recover_services(bot)
+    except Exception as e:
+        logger.warning("Не удалось восстановить сервисные потоки после рестарта: %s", e)
+
     logger.info("Бот запущен ✅")
 
     try:
