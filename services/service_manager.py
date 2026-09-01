@@ -34,6 +34,49 @@
 изначально запрошенного времени сбора, а не продлевает его. Для коротких
 пауз это несущественно; точное сохранение "оставшегося времени" требует
 доработки самого парсера отдельным заходом.
+
+──────────────────────────────────────────────────────────────────────────
+НЕЗАВИСИМОСТЬ ОТ ЖИЗНИ SHINOA И ВОССТАНОВЛЕНИЕ ПОСЛЕ ПЕРЕЗАПУСКА
+──────────────────────────────────────────────────────────────────────────
+
+Два независимых механизма, оба нужны одновременно:
+
+1. Дочерний процесс запускается с start_new_session=True (это os.setsid()
+   в дочернем процессе перед exec) — он получает СВОЮ группу процессов и
+   сессию, отвязанную от терминала/сессии Shinoa. Благодаря этому:
+   - Ctrl+C в терминале, где крутится Shinoa, посылает SIGINT только
+     группе процессов терминала — дочерний парсер в неё больше не входит,
+     сигнал до него не долетает;
+   - закрытие терминала/потеря SSH-сессии (SIGHUP) тоже не долетает.
+   ВАЖНО: это НЕ защищает от systemd с KillMode=control-group (по
+   умолчанию) — тот убивает всё в cgroup юнита независимо от сессии/группы
+   процессов. Если Shinoa когда-нибудь будет задеплоена как systemd-сервис
+   и это важно сохранить — там нужно явно поставить KillMode=process в
+   unit-файле, либо принять, что systemctl stop/restart убьёт и потоки.
+
+2. Мы не держим ничего критичного только в оперативной памяти. Каждый
+   запуск/пауза/резюм/остановка сразу пишет полный снимок активных потоков
+   в registry.json (STATUS_DIR) — pid, пути к status.json/.log, команда
+   запуска (для проверки от переиспользования pid), chat_id (куда слать
+   уведомления) и параметры. При старте bot.py вызывает recover() (см.
+   ниже и handlers/services_control.recover_services): для каждой записи
+   реестра проверяется, жив ли ещё процесс с этим pid (и что это точно ОН,
+   а не другой процесс, которому ОС успела переиспользовать тот же pid,
+   пока Shinoa была выключена, — сверяем /proc/<pid>/cmdline). Если жив —
+   Shinoa просто заново "подписывается" на него (recover), как будто сама
+   его и запускала. Если не пережил — читаем последний status.json (парсер
+   мог успеть сам дойти до done/error, пока Shinoa молчала) и один раз
+   доносим итог, вместо того чтобы тихо потерять результат многочасового
+   сбора.
+
+Из-за этого менеджер везде работает с "голым" pid (int) через os.kill(),
+а не с объектом asyncio.subprocess.Process — Process можно получить только
+для процесса, который САМИ породили в этой сессии Python, а после
+перезапуска Shinoa унаследованные (уже не дочерние — их усыновил init)
+процессы этим способом не адресовать. os.kill(pid, ...) работает
+одинаково в обоих случаях, поэтому весь код синхронизации/пауз/остановки
+написан через него, единообразно для свежезапущенных и "воскрешённых"
+потоков.
 """
 
 import asyncio
@@ -52,8 +95,10 @@ logger = logging.getLogger(__name__)
 
 STATUS_DIR = Path(tempfile.gettempdir()) / "shinoa_service_status"
 STATUS_DIR.mkdir(exist_ok=True)
+REGISTRY_FILE = STATUS_DIR / "registry.json"
 
-# service_id -> {run_id: {"process","status_file","watcher_task","params","started_at","paused"}}
+# service_id -> {run_id: {"pid","status_file","log_file","log_fh","watcher_task",
+#                          "cmd","chat_id","params","started_at","paused"}}
 _running: dict[str, dict[int, dict]] = {}
 # service_id -> следующий свободный run_id (растёт монотонно, не переиспользуется)
 _next_run_id: dict[str, int] = {}
@@ -67,6 +112,36 @@ def _runs(service_id: str) -> dict[int, dict]:
     return _running.setdefault(service_id, {})
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """kill(pid, 0) ничего не убивает — только проверяет, существует ли процесс
+    и есть ли у нас права его сигналить (для наших же детей всегда есть)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _cmdline_matches(pid: int, expected_cmd: list[str]) -> bool:
+    """
+    Подстраховка от редкого, но реального сценария: Shinoa была выключена
+    достаточно долго, поток успел завершиться, и ОС успела выдать его pid
+    какому-то совсем другому процессу. Без этой проверки мы рисковали бы
+    "усыновить" чужой процесс и слать ему SIGSTOP/SIGTERM.
+    Работает только на Linux (через /proc); если /proc недоступен (не Linux) —
+    молча доверяем pid как есть, ничего лучше без /proc сделать нельзя.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return True
+    actual = [p.decode("utf-8", "replace") for p in raw.split(b"\x00") if p]
+    return actual == expected_cmd
+
+
 def list_runs(service_id: str) -> list[int]:
     """Активные run_id для сервиса, в порядке запуска (по возрастанию номера)."""
     return sorted(_runs(service_id).keys())
@@ -76,8 +151,8 @@ def is_running(service_id: str, run_id: int = None) -> bool:
     runs = _runs(service_id)
     if run_id is not None:
         entry = runs.get(run_id)
-        return bool(entry and entry["process"].returncode is None)
-    return any(e["process"].returncode is None for e in runs.values())
+        return bool(entry and _is_pid_alive(entry["pid"]))
+    return any(_is_pid_alive(e["pid"]) for e in runs.values())
 
 
 def is_paused(service_id: str, run_id: int) -> bool:
@@ -100,14 +175,18 @@ def get_log_file(service_id: str, run_id: int) -> Path | None:
     return entry["log_file"] if entry else None
 
 
+def _read_status_file(status_file: Path) -> dict | None:
+    try:
+        return json.loads(status_file.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
 def read_status(service_id: str, run_id: int) -> dict | None:
     entry = _runs(service_id).get(run_id)
     if not entry:
         return None
-    try:
-        return json.loads(entry["status_file"].read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+    return _read_status_file(entry["status_file"])
 
 
 def _build_command(cfg: dict, params: dict, status_file: Path) -> list[str]:
@@ -130,10 +209,52 @@ def _build_command(cfg: dict, params: dict, status_file: Path) -> list[str]:
     return cmd
 
 
-async def start(service_id: str, params: dict, on_update=None, poll_seconds: float = 30.0) -> int:
+def _dump_registry() -> None:
+    """
+    Полный снимок текущих _running на диск — вызывается после КАЖДОЙ мутации
+    (старт/стоп/пауза/резюм/естественное завершение). Пишем во временный файл
+    и атомарно переименовываем — чтобы падение/убийство Shinoa посреди записи
+    не оставило битый JSON, который потом не открыть при восстановлении.
+    """
+    data = {}
+    for service_id, runs in _running.items():
+        for run_id, entry in runs.items():
+            data[f"{service_id}:{run_id}"] = {
+                "service_id": service_id,
+                "run_id": run_id,
+                "pid": entry["pid"],
+                "status_file": str(entry["status_file"]),
+                "log_file": str(entry["log_file"]),
+                "cmd": entry["cmd"],
+                "chat_id": entry["chat_id"],
+                "params": entry["params"],
+                "started_at": entry["started_at"],
+                "paused": entry["paused"],
+            }
+    tmp = REGISTRY_FILE.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(REGISTRY_FILE)
+    except OSError as e:
+        logger.warning("Не удалось сохранить registry.json: %s", e)
+
+
+def _load_registry() -> list[dict]:
+    if not REGISTRY_FILE.exists():
+        return []
+    try:
+        data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return list(data.values())
+
+
+async def start(service_id: str, params: dict, chat_id: int, on_update=None, poll_seconds: float = 30.0) -> int:
     """
     Запускает НОВЫЙ поток для сервиса (не блокируется тем, что другие потоки
     того же сервиса уже работают — несколько параллельных потоков штатны).
+    chat_id — куда слать уведомления о завершении; сохраняется в реестр на
+    диске, поэтому переживает перезапуск Shinoa (см. recover() ниже).
     on_update(run_id, status_dict) — опциональный async-колбэк, вызывается
     каждые poll_seconds, пока поток жив, плюс сразу при переходе в done/error.
     Возвращает run_id нового потока.
@@ -178,62 +299,74 @@ async def start(service_id: str, params: dict, on_update=None, poll_seconds: flo
         cwd=cfg.get("cwd"),
         stdout=log_fh,
         stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,  # см. большой комментарий в шапке файла
     )
+    # Только чтобы не плодить зомби-процессы среди СВОИХ прямых детей — на
+    # логику сервиса это не влияет, статус мы всё равно узнаём из status.json.
+    asyncio.create_task(_reap_zombie(process))
 
     watcher_task = asyncio.create_task(
-        _watch(service_id, run_id, status_file, process, on_update, poll_seconds)
+        _watch(service_id, run_id, status_file, process.pid, on_update, poll_seconds)
     )
     _runs(service_id)[run_id] = {
-        "process": process,
+        "pid": process.pid,
         "status_file": status_file,
         "log_file": log_file,
         "log_fh": log_fh,
+        "cmd": cmd,
+        "chat_id": chat_id,
         "watcher_task": watcher_task,
         "params": params,
         "started_at": started_at,
         "paused": False,
     }
+    _dump_registry()
     return run_id
 
 
-async def _watch(service_id: str, run_id: int, status_file: Path, process, on_update, poll_seconds: float = 30.0):
-    """
-    Каждые poll_seconds зовёт on_update(run_id, status) — даже если файл не
-    менялся (так карточка в Telegram видимо "тикает"). Завершение процесса
-    отслеживается через явный await на process.wait().
-    """
-    wait_task = asyncio.create_task(process.wait())
+async def _reap_zombie(process: "asyncio.subprocess.Process") -> None:
+    try:
+        await process.wait()
+    except Exception:
+        pass
 
+
+async def _watch(service_id: str, run_id: int, status_file: Path, pid: int, on_update, poll_seconds: float = 30.0):
+    """
+    Каждые poll_seconds читает status.json и зовёт on_update(run_id, status).
+    Живость процесса проверяется через os.kill(pid, 0) — единообразно для
+    свежезапущенных потоков и для "воскрешённых" после перезапуска Shinoa
+    (у вторых просто нет объекта asyncio.subprocess.Process, которым можно
+    было бы явно await'ить, — это уже не наши дети, их усыновил init).
+    """
     def _read():
-        try:
-            return json.loads(status_file.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None
+        return _read_status_file(status_file)
 
     try:
         while True:
-            done, _ = await asyncio.wait({wait_task}, timeout=poll_seconds)
+            await asyncio.sleep(poll_seconds)
 
             data = _read()
-            if data is not None:
-                if on_update:
-                    await on_update(run_id, data)
-                if data.get("status") in ("done", "error"):
-                    return
+            if data is not None and on_update:
+                await on_update(run_id, data)
+            if data is not None and data.get("status") in ("done", "error"):
+                return
 
-            if wait_task in done:
-                await asyncio.sleep(0.2)
-                data = _read()
+            if not _is_pid_alive(pid):
+                # Процесс исчез, не оставив финального статуса — падение,
+                # OOM-killer, или его убили вместе с Shinoa (если Ctrl+C/
+                # systemd всё же дотянулись до него, см. шапку файла).
                 if data is None:
                     data = {"status": "error", "error": "Процесс завершился без итогового статуса"}
                 elif data.get("status") == "running":
-                    data["status"] = "error"
-                    data["error"] = data.get("error") or "Процесс неожиданно завершился"
+                    data = {**data, "status": "error",
+                            "error": data.get("error") or "Процесс неожиданно завершился"}
+                else:
+                    return
                 if on_update:
                     await on_update(run_id, data)
                 return
     except asyncio.CancelledError:
-        wait_task.cancel()
         raise
     finally:
         entry = _runs(service_id).pop(run_id, None)
@@ -242,6 +375,7 @@ async def _watch(service_id: str, run_id: int, status_file: Path, process, on_up
                 entry["log_fh"].close()
             except OSError:
                 pass
+        _dump_registry()
 
 
 async def stop(service_id: str, run_id: int) -> bool:
@@ -249,21 +383,35 @@ async def stop(service_id: str, run_id: int) -> bool:
     entry = _runs(service_id).get(run_id)
     if not entry:
         return False
-    process = entry["process"]
+    pid = entry["pid"]
     watcher_task = entry["watcher_task"]
-    if process.returncode is None:
+    if _is_pid_alive(pid):
         if entry.get("paused"):
-            # замороженный SIGSTOP-ом процесс не реагирует на terminate(),
-            # его сначала нужно разбудить SIGCONT, иначе он зависнет в waitfor
+            # замороженный SIGSTOP-ом процесс не реагирует на SIGTERM,
+            # его сначала нужно разбудить SIGCONT, иначе он зависнет намертво
             try:
-                process.send_signal(signal.SIGCONT)
+                os.kill(pid, signal.SIGCONT)
             except ProcessLookupError:
                 pass
-        process.terminate()
         try:
-            await asyncio.wait_for(process.wait(), timeout=10)
-        except asyncio.TimeoutError:
-            process.kill()
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        # Ждём мягкого завершения ощутимо дольше, чем раньше: после SIGTERM
+        # парсер (см. main.py, _sigterm_to_keyboard_interrupt) уходит в тот же
+        # graceful-путь, что и ручной Ctrl+C — а там ещё "дозачистка" очереди
+        # кандидатов на "продано" (до MAX_DRAIN_CANDIDATES_AT_END=30 штук по
+        # ~1 сек каждая) и генерация HTML-отчёта. 10 секунд было мало —
+        # убивали SIGKILL'ом прямо посреди этого, отчёт не успевал сформироваться.
+        for _ in range(120):  # ~60 секунд
+            if not _is_pid_alive(pid):
+                break
+            await asyncio.sleep(0.5)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     watcher_task.cancel()
     _runs(service_id).pop(run_id, None)
     if entry.get("log_fh"):
@@ -271,28 +419,95 @@ async def stop(service_id: str, run_id: int) -> bool:
             entry["log_fh"].close()
         except OSError:
             pass
+    _dump_registry()
     return True
 
 
 def pause(service_id: str, run_id: int) -> bool:
     entry = _runs(service_id).get(run_id)
-    if not entry or entry["process"].returncode is not None:
+    if not entry or not _is_pid_alive(entry["pid"]):
         return False
     try:
-        entry["process"].send_signal(signal.SIGSTOP)
+        os.kill(entry["pid"], signal.SIGSTOP)
     except ProcessLookupError:
         return False
     entry["paused"] = True
+    _dump_registry()
     return True
 
 
 def resume(service_id: str, run_id: int) -> bool:
     entry = _runs(service_id).get(run_id)
-    if not entry or entry["process"].returncode is not None:
+    if not entry or not _is_pid_alive(entry["pid"]):
         return False
     try:
-        entry["process"].send_signal(signal.SIGCONT)
+        os.kill(entry["pid"], signal.SIGCONT)
     except ProcessLookupError:
         return False
     entry["paused"] = False
+    _dump_registry()
     return True
+
+
+async def recover(on_update_factory) -> list[tuple[str, int, str]]:
+    """
+    Вызывается ОДИН РАЗ при старте бота (см. handlers/services_control.
+    recover_services, дёргается из bot.py перед start_polling). Проходит по
+    сохранённому на диске реестру потоков:
+
+    - если процесс пережил перезапуск (жив и это точно он, не переиспользо-
+      ванный pid) — заново подключается к нему: создаёт watcher-задачу и
+      кладёт обратно в _running, как будто сама его и запускала. С этого
+      момента Shinoa снова умеет показывать его в списке потоков, ставить
+      на паузу, снимать, удалять — всё как обычно.
+    - если процесс не пережил — читает последний status.json (парсер мог
+      сам успеть дойти до done/error, пока Shinoa молчала) и ОДИН РАЗ зовёт
+      on_update с этим (или синтезированным "пропал без вести") статусом —
+      чтобы результат многочасового сбора не потерялся молча.
+
+    on_update_factory(service_id, run_id, chat_id) -> on_update — вызывающий
+    код (services_control) сам знает, как построить колбэк с нужными
+    Telegram-уведомлениями/live-редактированием карточки; менеджер сервисов
+    сюда лезть не должен, он ничего не знает про Telegram.
+
+    Возвращает список (service_id, run_id, "adopted"|<финальный статус>) —
+    просто для лога/диагностики у вызывающей стороны.
+    """
+    results = []
+    for entry in _load_registry():
+        service_id, run_id, pid = entry["service_id"], entry["run_id"], entry["pid"]
+        cmd = entry.get("cmd") or []
+        status_file = Path(entry["status_file"])
+        alive = _is_pid_alive(pid) and _cmdline_matches(pid, cmd)
+        status = _read_status_file(status_file)
+        on_update = on_update_factory(service_id, run_id, entry["chat_id"])
+
+        if alive and (status is None or status.get("status") == "running"):
+            watcher_task = asyncio.create_task(_watch(service_id, run_id, status_file, pid, on_update))
+            _runs(service_id)[run_id] = {
+                "pid": pid,
+                "status_file": status_file,
+                "log_file": Path(entry["log_file"]),
+                "log_fh": None,  # не наш дескриптор — процесс пишет в него сам
+                "cmd": cmd,
+                "chat_id": entry["chat_id"],
+                "watcher_task": watcher_task,
+                "params": entry["params"],
+                "started_at": entry["started_at"],
+                "paused": entry.get("paused", False),
+            }
+            _next_run_id[service_id] = max(_next_run_id.get(service_id, 1), run_id + 1)
+            logger.info("Восстановлена связь с потоком %s #%d (pid=%d)", service_id, run_id, pid)
+            results.append((service_id, run_id, "adopted"))
+        else:
+            final = status or {"status": "error", "error": "Процесс исчез, пока Shinoa была выключена"}
+            if final.get("status") == "running":
+                final = {**final, "status": "error",
+                         "error": "Процесс пропал, пока Shinoa была выключена (не пережил перезапуск)"}
+            logger.info("Поток %s #%d не пережил перезапуск, итог: %s", service_id, run_id, final.get("status"))
+            if on_update:
+                await on_update(run_id, final)
+            results.append((service_id, run_id, final.get("status")))
+
+    _dump_registry()  # реестр теперь отражает только реально восстановленные потоки
+    return results

@@ -231,10 +231,16 @@ async def format_task(task: dict) -> str:
 
     sched_text = "\n".join(sched_lines) if sched_lines else " (нет расписания)"
 
+    # Полное описание: не обрезаем; не дублируем, если текст совпадает с заголовком
+    text = (task.get("text") or "").strip()
+    text_block = ""
+    if text and text != (task.get("title") or "").strip():
+        text_block = f"\n📋 {escape(text)}"
+
     return (
-        f"{p} <b>{task['title'].capitalize()}</b> <code>[#{task['id']}]</code>\n"
+        f"{p} <b>{escape(task['title'])}</b> <code>[#{task['id']}]</code>\n"
         f"🏷 {task['category'].capitalize()} 📌 {t_label}\n"
-        f"🕐{sched_text}"
+        f"🕐{sched_text}{text_block}"
     )
 
 

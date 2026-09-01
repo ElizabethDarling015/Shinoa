@@ -21,10 +21,22 @@ from config import DEFAULT_TIMEZONE, WEATHER_API_KEY, HOST_IP_URL
 from services.weather import get_weather
 from database.connection import get_db
 
+from html import escape
+
 logger = logging.getLogger(__name__)
 
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 WEEKDAY_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+def _full_task_line(task: dict) -> str:
+    """Строка задачи для сводки: приоритет + заголовок + полное описание без обрезки."""
+    p = PRIORITY_EMOJI.get(task["priority"], "🟡")
+    head = f"  {p} {escape(task['title'])}"
+    text = (task.get("text") or "").strip()
+    if text and text != (task.get("title") or "").strip():
+        return f"{head}\n{escape(text)}"
+    return head
 
 
 def _get_local_date(created_at_str: str, tz) -> date:
@@ -107,8 +119,7 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     lines.append("\n<b>🌅 Сегодняшние задачи:</b>")
     if today_tasks:
         for task in today_tasks[:10]:
-            p = PRIORITY_EMOJI.get(task["priority"], "🟡")
-            lines.append(f"  {p} {task['title']}")
+            lines.append(_full_task_line(task))
         if len(today_tasks) > 10:
             lines.append(f"  <i>...и ещё {len(today_tasks) - 10}</i>")
     else:
@@ -118,8 +129,7 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     if tomorrow_tasks:
         lines.append("\n<b>🌙 Завтрашние задачи:</b>")
         for task in tomorrow_tasks[:10]:
-            p = PRIORITY_EMOJI.get(task["priority"], "🟡")
-            lines.append(f"  {p} {task['title']}")
+            lines.append(_full_task_line(task))
         if len(tomorrow_tasks) > 10:
             lines.append(f"  <i>...и ещё {len(tomorrow_tasks) - 10}</i>")
 

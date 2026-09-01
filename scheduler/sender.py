@@ -56,9 +56,11 @@ async def send_reminder(
     now = datetime.now().strftime("%H:%M")
     p_emoji = PRIORITY_EMOJI.get(priority, "🟡")
 
+    body = ""
+    if text and str(text).strip() != (title or "").strip():
+        body = f"\n\n{escape(str(text))}"
     msg = (
-        f"🔔 {p_emoji} <b>{title}</b>\n\n"
-        f"{text}\n\n"
+        f"🔔 {p_emoji} <b>{escape(title)}</b>{body}\n\n"
         f"<i>{now}</i>"
     )
 

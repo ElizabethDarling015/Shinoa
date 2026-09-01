@@ -916,8 +916,7 @@ async def cb_morning_priority(call: CallbackQuery, state: FSMContext):
         return
 
     priority = call.data.split(":", 1)[1]
-
-    title = task_text[:50] + ("…" if len(task_text) > 50 else "")
+    title = task_text
 
     task_id = await db.create_task(
         chat_id=call.message.chat.id,

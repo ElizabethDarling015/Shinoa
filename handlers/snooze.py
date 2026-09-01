@@ -34,7 +34,7 @@ async def cb_done(call: CallbackQuery):
     task = await db.get_task(task_id)
 
     if not task or task["chat_id"] != call.message.chat.id:
-        await call.answer("Задача не найдена.", show_alert=True)
+        await call.answer("Задача не найдена.🙄", show_alert=True)
         return
 
     if task["type"] == "morning":
@@ -108,7 +108,7 @@ async def cb_snooze(call: CallbackQuery):
 
     task = await db.get_task(task_id)
     if not task or task["chat_id"] != call.message.chat.id:
-        await call.answer("Задача не найдена.", show_alert=True)
+        await call.answer("Задача не найдена.🙄", show_alert=True)
         return
 
     tz = pytz.timezone(DEFAULT_TIMEZONE)
@@ -162,7 +162,7 @@ async def cb_delete_task(call: CallbackQuery):
 
     task = await db.get_task(task_id)
     if not task or task["chat_id"] != call.message.chat.id:
-        await call.answer("Задача не найдена.", show_alert=True)
+        await call.answer("Задача не найдена.🙄", show_alert=True)
         return
 
     schedule_ids = await db.delete_schedules_for_task(task_id)

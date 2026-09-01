@@ -16,6 +16,7 @@
 этот файл не знает специфики ни одного конкретного сервиса.
 """
 
+import asyncio
 import logging
 import html
 
@@ -59,16 +60,26 @@ FOOTER_DESCRIPTION = (
 _view_state: dict[tuple[int, int], tuple] = {}
 
 
-def _set_view(chat_id: int, message_id: int, view: tuple) -> None:
-    _view_state[(chat_id, message_id)] = view
+def _set_view(chat_id: int, message_id: int, kind: str, service_id: str,
+               run_id: int | None = None, as_caption: bool = False) -> None:
+    _view_state[(chat_id, message_id)] = (kind, service_id, run_id, as_caption)
 
 
 def _clear_view(chat_id: int, message_id: int) -> None:
     _view_state.pop((chat_id, message_id), None)
 
 
-def _is_viewing_thread(chat_id: int, message_id: int, service_id: str, run_id: int) -> bool:
-    return _view_state.get((chat_id, message_id)) == ("thread", service_id, run_id)
+def _find_thread_viewer(service_id: str, run_id: int) -> tuple[int, int, bool] | None:
+    """Есть ли сейчас сообщение, показывающее карточку именно этого потока —
+    и если да, то какое (chat_id, message_id) и живёт ли оно как подпись к файлу.
+    Не привязано к тому, кто и когда запустил поток: работает одинаково что для
+    только что стартовавшего потока, что для восстановленного после перезапуска
+    Shinoa (см. recover_services) — просто в последнем случае обычно вернёт None,
+    пока пользователь сам не откроет карточку этого потока заново."""
+    for (chat_id, message_id), (kind, sid, rid, as_caption) in _view_state.items():
+        if kind == "thread" and sid == service_id and rid == run_id:
+            return chat_id, message_id, as_caption
+    return None
 
 
 # ──────────────────────────────────────────────────────────
@@ -218,7 +229,7 @@ async def _show_card(message: Message, service_id: str, as_caption: bool = False
     if not cfg:
         await message.answer("❌ Сервис не найден в реестре.")
         return
-    _set_view(message.chat.id, message.message_id, ("card", service_id))
+    _set_view(message.chat.id, message.message_id, "card", service_id)
     await _edit_card(
         message.bot, message.chat.id, message.message_id,
         _card_text(service_id, cfg), _card_keyboard(service_id, minimal=minimal), as_caption,
@@ -283,7 +294,7 @@ async def _show_thread(message: Message, service_id: str, run_id: int, as_captio
     if not cfg:
         await message.answer("❌ Сервис не найден в реестре.")
         return
-    _set_view(message.chat.id, message.message_id, ("thread", service_id, run_id))
+    _set_view(message.chat.id, message.message_id, "thread", service_id, run_id, as_caption)
     await _edit_card(
         message.bot, message.chat.id, message.message_id,
         _thread_text(service_id, cfg, run_id), _thread_keyboard(service_id, run_id, minimal=minimal), as_caption,
@@ -341,10 +352,30 @@ async def cb_svc_resume(call: CallbackQuery):
 @router.callback_query(F.data.startswith("svc_delete_thread:"))
 async def cb_svc_delete_thread(call: CallbackQuery):
     _, service_id, run_id = call.data.split(":")
-    await mgr.stop(service_id, int(run_id))
-    await call.answer("Поток удалён")
-    # потока больше нет — возвращаемся на главную карточку сервиса
-    await _show_card(call.message, service_id, as_caption=bool(call.message.document))
+    run_id = int(run_id)
+    as_caption = bool(call.message.document)
+    await call.answer("Останавливаю поток…")
+
+    # mgr.stop() может занять до ~минуты (см. комментарий в service_manager.py —
+    # даём парсеру время на graceful-стоп: дозачистка кандидатов + отчёт по уже
+    # собранному). Не блокируем этим обработчик нажатия — иначе кнопка будет
+    # выглядеть "зависшей". Показываем промежуточный статус и досчитываем в фоне.
+    # Пока идёт остановка (до минуты), это сообщение временно ничего не
+    # "показывает" в терминах трекера — иначе периодический on_update этого же
+    # ещё-живого-пока-останавливается потока перезатрёт наш статус "⏳ Останавливаю...".
+    _clear_view(call.message.chat.id, call.message.message_id)
+    await _edit_card(
+        call.message.bot, call.message.chat.id, call.message.message_id,
+        "⏳ Останавливаю поток — парсер дозачищает данные и формирует отчёт "
+        "по уже собранному, это может занять до минуты...",
+        InlineKeyboardMarkup(inline_keyboard=[]), as_caption,
+    )
+
+    async def _stop_and_refresh():
+        await mgr.stop(service_id, run_id)
+        await _show_card(call.message, service_id, as_caption=as_caption)
+
+    asyncio.create_task(_stop_and_refresh())
 
 
 @router.callback_query(F.data == "svc_close")
@@ -423,7 +454,7 @@ async def _begin_input_flow(call: CallbackQuery, state: FSMContext, service_id: 
 
     # Экран ввода параметров — не карточка и не поток, чтобы автообновление
     # прогресса ДРУГОГО, уже бегущего потока не затёрло этот промпт.
-    _set_view(call.message.chat.id, call.message.message_id, ("input", service_id))
+    _set_view(call.message.chat.id, call.message.message_id, "input", service_id)
 
     prompt = cfg["input_prompts"]["url"]
     await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
@@ -472,7 +503,7 @@ async def step_waiting_url(message: Message, state: FSMContext):
 
     await state.update_data(url=url)
     await state.set_state(ServiceInput.waiting_hours)
-    _set_view(data["card_chat_id"], data["card_msg_id"], ("input", service_id))
+    _set_view(data["card_chat_id"], data["card_msg_id"], "input", service_id)
 
     prompt = cfg["input_prompts"]["hours"]
     await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"], prompt, _cancel_keyboard(service_id), as_caption)
@@ -519,21 +550,38 @@ def _run_title(service_id: str, run_id: int, status: dict, cfg: dict) -> str:
     return status.get("niche_title") or params.get("url") or cfg["title"]
 
 
-async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: dict, as_caption: bool = False):
-    cfg = get_service(service_id)
+def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
+    """
+    Строит колбэк on_update(run_id, status), который менеджер сервисов дёргает
+    на каждый опрос. Специально НЕ привязан к конкретному (chat_id, message_id)
+    "домашней" карточки — вместо этого на каждый вызов заново ищет через
+    _find_thread_viewer, смотрит ли кто-то ПРЯМО СЕЙЧАС на карточку именно
+    этого потока, и редактирует только её (см. рассуждение в шапке файла про
+    _view_state). Это же делает колбэк одинаково пригодным и для свежего
+    запуска (_launch), и для потока, восстановленного после перезапуска Shinoa
+    (recover_services) — во втором случае просто сразу после перезапуска
+    "смотрящего" ещё ни у кого нет, пока пользователь сам не откроет карточку
+    потока — и живые обновления процента сами включатся с этого момента.
 
+    chat_id — единственное, что обязательно привязано заранее: он не может
+    поменяться в течение жизни потока и нужен, чтобы было куда слать
+    уведомление о завершении, даже если никакой карточки этого потока сейчас
+    не открыто нигде (например, сразу после restart).
+    """
     async def on_update(run_id: int, status: dict):
         st = status.get("status")
+        viewer = _find_thread_viewer(service_id, run_id)
         try:
             if st == "running":
-                # Живое обновление % прогресса — ТОЛЬКО если это самое сообщение прямо
-                # сейчас показывает карточку именно этого потока. Если пользователь
-                # ушёл в другое меню или смотрит на другой поток — ничего не трогаем,
-                # экран увидит актуальное состояние сам, при следующем открытии этой
-                # карточки (см. _show_thread — оно всегда читает status свежим).
-                if _is_viewing_thread(chat_id, message_id, service_id, run_id):
-                    await _edit_card(bot, chat_id, message_id, _thread_text(service_id, cfg, run_id),
-                                      _thread_keyboard(service_id, run_id, minimal=as_caption), as_caption)
+                # Живое обновление % прогресса — только если это самое
+                # сообщение прямо сейчас показывает карточку именно этого
+                # потока. Иначе молчим: экран увидит актуальные данные сам,
+                # как только пользователь откроет эту карточку (_show_thread
+                # всегда читает status.json заново, не из кэша).
+                if viewer:
+                    v_chat, v_msg, v_caption = viewer
+                    await _edit_card(bot, v_chat, v_msg, _thread_text(service_id, cfg, run_id),
+                                      _thread_keyboard(service_id, run_id, minimal=v_caption), v_caption)
                 return
 
             title = _run_title(service_id, run_id, status, cfg)
@@ -567,28 +615,58 @@ async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: d
                     parse_mode="HTML",
                 )
 
-            # Поток завершился (done/error). Карточку сервиса в этом сообщении
-            # возвращаем ТОЛЬКО если пользователь прямо сейчас смотрел именно на
-            # карточку этого потока (она стала неактуальной — поток пропал). Если
-            # он смотрит на что-то другое, это сообщение не трогаем вообще —
-            # отдельное уведомление выше он уже получил.
-            if _is_viewing_thread(chat_id, message_id, service_id, run_id):
-                _set_view(chat_id, message_id, ("card", service_id))
-                await _edit_card(bot, chat_id, message_id, _card_text(service_id, cfg),
-                                  _card_keyboard(service_id, minimal=as_caption), as_caption)
+            # Поток завершился (done/error). Карточку, которая его показывала,
+            # возвращаем к главной карточке сервиса — если, конечно, кто-то её
+            # прямо сейчас показывал (см. viewer выше). Если никто не смотрел —
+            # это сообщение вообще не трогаем, уведомление выше уже отправлено.
+            if viewer:
+                v_chat, v_msg, v_caption = viewer
+                _set_view(v_chat, v_msg, "card", service_id)
+                await _edit_card(bot, v_chat, v_msg, _card_text(service_id, cfg),
+                                  _card_keyboard(service_id, minimal=v_caption), v_caption)
         except TelegramBadRequest as e:
             if "message is not modified" not in str(e).lower():
                 logger.warning("Ошибка обновления карточки сервиса %s (поток %s): %s", service_id, run_id, e)
 
+    return on_update
+
+
+async def _launch(bot, chat_id: int, message_id: int, service_id: str, params: dict, as_caption: bool = False):
+    cfg = get_service(service_id)
+    on_update = _build_on_update(bot, service_id, cfg, chat_id)
+
     try:
-        run_id = await mgr.start(service_id, params, on_update=on_update)
+        run_id = await mgr.start(service_id, params, chat_id, on_update=on_update)
     except mgr.ServiceError as e:
         await _edit_card(bot, chat_id, message_id, f"❌ {e}", _card_keyboard(service_id, minimal=as_caption), as_caption)
         return
 
     # Сразу после запуска это сообщение показывает карточку нового потока —
     # регистрируем это в трекере, иначе первое же периодическое обновление
-    # прогресса будет молча проигнорировано как "пользователь не смотрит".
-    _set_view(chat_id, message_id, ("thread", service_id, run_id))
+    # прогресса будет молча проигнорировано как "никто не смотрит".
+    _set_view(chat_id, message_id, "thread", service_id, run_id, as_caption)
     await _edit_card(bot, chat_id, message_id, _thread_text(service_id, cfg, run_id),
                       _thread_keyboard(service_id, run_id, minimal=as_caption), as_caption)
+
+
+async def recover_services(bot) -> None:
+    """
+    Дёргается ОДИН РАЗ при старте бота (см. bot.py, перед start_polling) —
+    восстанавливает слежение за потоками, которые остались физически
+    запущены (или успели сами дойти до done/error), пока Shinoa была
+    выключена. Подробности механизма — в service_manager.recover() и в
+    большом комментарии в шапке service_manager.py.
+    """
+    def factory(service_id: str, run_id: int, chat_id: int):
+        cfg = get_service(service_id)
+        if not cfg:
+            # Сервис исчез из реестра (например, убрали .env-блок) —
+            # не с кем и незачем разговаривать про этот поток.
+            async def _noop(_run_id, _status):
+                pass
+            return _noop
+        return _build_on_update(bot, service_id, cfg, chat_id)
+
+    recovered = await mgr.recover(factory)
+    if recovered:
+        logger.info("После перезапуска Shinoa восстановлено/донесено: %s", recovered)
