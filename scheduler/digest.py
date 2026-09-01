@@ -123,7 +123,7 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
         if len(today_tasks) > 10:
             lines.append(f"  <i>...и ещё {len(today_tasks) - 10}</i>")
     else:
-        lines.append("  <i>На сегодня задач нет</i>")
+        lines.append("  <i>На сегодня задач нет🙄</i>")
 
     # Блок: Завтрашние задачи
     if tomorrow_tasks:
@@ -252,22 +252,21 @@ async def send_digest(bot: Bot, chat_id: int, city: str = None):
         return
 
     try:
-        old_id = await _get_last_digest_pin(chat_id)
-        if old_id:
-            try:
-                await bot.unpin_chat_message(chat_id=chat_id, message_id=old_id)
-            except Exception as e:
-                logger.warning("Не удалось открепить старую сводку: %s", e)
+        # Снимаем ВСЕ предыдущие закрепления — включая «древние» пины,
+        # чьи ID никогда не сохранялись в БД
+        try:
+            await bot.unpin_all_chat_messages(chat_id=chat_id)
+        except Exception as e:
+            logger.warning("Не удалось открепить старые сводки: %s", e)
 
         await bot.pin_chat_message(
             chat_id=chat_id,
             message_id=msg.message_id,
             disable_notification=True,
         )
-        await _set_last_digest_pin(chat_id, msg.message_id)
         logger.info("Сводка закреплена → чат %s", chat_id)
     except Exception as e:
-        logger.warning("Не удалось закрепить сводку: %s", e)
+        logger.warning("Не удалось закрепить сводку: %s", chat_id, e)
 
 
 async def send_all_digests(bot: Bot):

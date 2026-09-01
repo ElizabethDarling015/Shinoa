@@ -38,10 +38,16 @@ class ServiceInput(StatesGroup):
     waiting_hours = State()
 
 
-FOOTER_DESCRIPTION = (
-    "⚙️ <b>Настройки</b> — параметры этого сервиса (пока нет ни одной)\n"
-    "🧪 <b>Тест</b> — быстрый пробный сбор, ~2 минуты"
-)
+class ServiceSettingsInput(StatesGroup):
+    waiting_value = State()
+
+
+def _footer_description(cfg: dict) -> str:
+    if cfg.get("settings"):
+        settings_line = "⚙️ <b>Настройки</b> — прокси/куки и другие параметры для новых потоков"
+    else:
+        settings_line = "⚙️ <b>Настройки</b> — параметры этого сервиса (пока нет ни одной)"
+    return f"{settings_line}\n🧪 <b>Тест</b> — быстрый пробный сбор, ~2 минуты"
 
 
 # ──────────────────────────────────────────────────────────
@@ -80,6 +86,27 @@ def _find_thread_viewer(service_id: str, run_id: int) -> tuple[int, int, bool] |
         if kind == "thread" and sid == service_id and rid == run_id:
             return chat_id, message_id, as_caption
     return None
+
+
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """
+    Создаёт фоновую asyncio-задачу и, в отличие от голого asyncio.create_task(),
+    держит на неё живую ссылку, пока она не завершится.
+
+    Это не стилистика — без этого задачу может в любой момент подобрать
+    сборщик мусора и молча уничтожить ПОСРЕДИ выполнения: у event loop'а
+    ссылки на задачи только слабые (см. официальное предупреждение в доке
+    asyncio.create_task). Ровно это и произошло с досрочной остановкой потока
+    (см. cb_svc_delete_thread) — задача "остановить и прислать результат"
+    создавалась без сохранённой ссылки, могла быть уничтожена на середине, и
+    пользователь оставался без файла и без объяснения, что случилось.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 # ──────────────────────────────────────────────────────────
@@ -235,7 +262,7 @@ def _card_text(service_id: str, cfg: dict) -> str:
         body = "\n".join(lines)
     else:
         body = "Сейчас не запущен."
-    return f"{cfg['title']}\n\n{body}\n\n{FOOTER_DESCRIPTION}"
+    return f"{cfg['title']}\n\n{body}\n\n{_footer_description(cfg)}"
 
 
 async def _show_card(message: Message, service_id: str, as_caption: bool = False, minimal: bool = False):
@@ -390,7 +417,7 @@ async def cb_svc_delete_thread(call: CallbackQuery):
         await mgr.stop(service_id, run_id)
         await _show_card(call.message, service_id, as_caption=as_caption)
 
-    asyncio.create_task(_stop_and_refresh())
+    _fire_and_forget(_stop_and_refresh())
 
 
 @router.callback_query(F.data == "svc_close")
@@ -405,10 +432,100 @@ async def cb_svc_close(call: CallbackQuery):
         pass
 
 
+def _settings_text(cfg: dict, service_id: str) -> str:
+    settings = mgr.get_settings(service_id)
+    lines = [f"{cfg['title']} — настройки", ""]
+    for field in cfg.get("settings", []):
+        value = settings.get(field["key"])
+        state_str = "задано ✅" if value else "не задано"
+        lines.append(f"{field['label']}: {state_str}")
+    lines.append("")
+    lines.append("Действуют на все НОВЫЕ потоки этого сервиса — уже запущенные не затрагивают.")
+    return "\n".join(lines)
+
+
+def _settings_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=field["label"], callback_data=f"svc_setting_field:{service_id}:{field['key']}")]
+        for field in cfg.get("settings", [])
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"svc_open:{service_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.callback_query(F.data.startswith("svc_settings:"))
 async def cb_svc_settings(call: CallbackQuery):
-    """Заглушка — конкретных настроек пока нет ни у одного сервиса."""
-    await call.answer("🚧 У этого сервиса пока нет настроек", show_alert=True)
+    service_id = call.data.split(":", 1)[1]
+    cfg = get_service(service_id)
+    if not cfg or not cfg.get("settings"):
+        await call.answer("🚧 У этого сервиса пока нет настроек", show_alert=True)
+        return
+    await call.answer()
+    as_caption = bool(call.message.document)
+    # Не "thread" — просто чтобы автообновление прогресса какого-то потока
+    # не перезатёрло этот экран, пока пользователь смотрит на настройки.
+    _set_view(call.message.chat.id, call.message.message_id, "card", service_id)
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      _settings_text(cfg, service_id), _settings_keyboard(service_id, cfg), as_caption)
+
+
+@router.callback_query(F.data.startswith("svc_setting_field:"))
+async def cb_svc_setting_field(call: CallbackQuery, state: FSMContext):
+    _, service_id, key = call.data.split(":", 2)
+    cfg = get_service(service_id)
+    field = next((f for f in (cfg or {}).get("settings", []) if f["key"] == key), None)
+    if not cfg or not field:
+        await call.answer("Настройка не найдена", show_alert=True)
+        return
+
+    await call.answer()
+    as_caption = bool(call.message.document)
+    await state.set_state(ServiceSettingsInput.waiting_value)
+    await state.update_data(
+        service_id=service_id, key=key, as_caption=as_caption,
+        card_chat_id=call.message.chat.id, card_msg_id=call.message.message_id,
+    )
+    _set_view(call.message.chat.id, call.message.message_id, "input", service_id)
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      field["prompt"], _cancel_keyboard(service_id), as_caption)
+
+
+@router.message(ServiceSettingsInput.waiting_value, lambda m: not _is_command(m))
+async def step_setting_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    service_id = data["service_id"]
+    key = data["key"]
+    as_caption = data.get("as_caption", False)
+    cfg = get_service(service_id)
+    field = next((f for f in (cfg or {}).get("settings", []) if f["key"] == key), None)
+
+    text = (message.text or "").strip()
+    try:
+        # Куки — по сути секрет, да и прокси с логином/паролем тоже — не
+        # оставляем это висеть в истории чата, сразу удаляем сообщение с вводом.
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+    if not cfg or not field:
+        await state.clear()
+        return
+
+    if text == "-":
+        mgr.set_setting(service_id, key, None)
+    elif field.get("is_file_content"):
+        # Парсер ждёт ПУТЬ к файлу (--cookies-file), не сам текст — сохраняем
+        # присланное отдельным файлом рядом со status.json/registry.json.
+        override_path = mgr.STATUS_DIR / f"{service_id}_{key}_override.txt"
+        override_path.write_text(text, encoding="utf-8")
+        mgr.set_setting(service_id, key, str(override_path))
+    else:
+        mgr.set_setting(service_id, key, text)
+
+    await state.clear()
+    _set_view(data["card_chat_id"], data["card_msg_id"], "card", service_id)
+    await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"],
+                      _settings_text(cfg, service_id), _settings_keyboard(service_id, cfg), as_caption)
 
 
 @router.callback_query(F.data.startswith("svc_cancel_input:"))

@@ -58,7 +58,7 @@ async def cmd_habits(message: Message):
 
     if not habits:
         await message.answer(
-            "У вас пока нет привычек.\n\n"
+            "У вас пока нет привычек.🙄\n\n"
             "Создать первую: /habit_new\n\n"
             "<i>Примеры: вода 💧, спорт 🏃, чтение 📚, сон 😴</i>",
             parse_mode="HTML",
@@ -204,7 +204,7 @@ async def cmd_delete_habit(message: Message):
 
     habit = await db.get_habit(habit_id)
     if not habit or habit["chat_id"] != message.chat.id:
-        await message.answer("Привычка не найдена.")
+        await message.answer("Привычка не найдена.🙄")
         return
 
     await db.delete_habit(habit_id, message.chat.id)

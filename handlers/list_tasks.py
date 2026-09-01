@@ -200,9 +200,9 @@ async def cb_tasks_categories(call: CallbackQuery):
 
 @router.callback_query(F.data == "tasks_menu:priority")
 async def cb_tasks_priority(call: CallbackQuery):
-    """Показывает все задачи по приоритетам"""
+    """Показывает все задачи по приоритетам, редактируя текущее сообщение"""
     await call.answer()
-    await send_task_list(call.message, exclude_type="morning", use_close_keyboard=True)
+    await send_task_list(call.message, exclude_type="morning", edit=True)
 
 
 # ──────────────────────────────────────────────────────────
@@ -250,7 +250,7 @@ async def _build_category_text(chat_id: int, category: str) -> str:
     """Генерирует текст списка задач для конкретной категории."""
     tasks = await db.get_tasks(chat_id, category=category)
     if not tasks:
-        return f"📂 В категории «<b>{category.capitalize()}</b>» пока нет активных задач."
+        return f"📂 В категории «<b>{category.capitalize()}</b>» пока нет активных задач.🙄"
 
     tasks_by_priority = {"high": [], "medium": [], "low": []}
     for task in tasks:
@@ -283,7 +283,7 @@ async def _build_list_text(chat_id: int, category: str = None, priority: str = N
     if not tasks:
         filter_note = f" по фильтру «{category or priority}»" if (category or priority) else ""
         return (
-            f"У вас нет активных задач{filter_note}.\n\n"
+            f"У вас нет активных задач{filter_note}.🙄\n\n"
             "Создать:\n"
             "/week — еженедельное\n"
             "/monthly — ежемесячное\n"
@@ -348,16 +348,28 @@ async def send_task_list(
     priority: str = None,
     exclude_type: str = None,
     use_close_keyboard: bool = False,
+    edit: bool = False,
 ):
-    """Основная логика показа списка задач"""
+    """Основная логика показа списка задач.
+    edit=True — редактирует текущее сообщение (для inline-кнопок),
+    иначе отправляет новое (для команд типа /list)."""
     text = await _build_list_text(message.chat.id, category, priority, exclude_type)
     keyboard = get_close_keyboard() if use_close_keyboard else get_list_nav_keyboard()
-    
-    msg = await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
-    
+
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        msg_id = message.message_id
+    else:
+        msg = await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        msg_id = msg.message_id
+
     # Сохраняем параметры, чтобы /delete мог пересобрать этот же список
     last_list_messages[message.chat.id] = {
-        "message_id": msg.message_id,
+        "message_id": msg_id,
         "type": "list",
         "category": category,
         "priority": priority,
@@ -406,7 +418,7 @@ async def cmd_delete(message: Message, command: CommandObject):
 
     task = await db.get_task(task_id)
     if not task or task["chat_id"] != message.chat.id:
-        await message.answer("Задача не найдена.")
+        await message.answer("Задача не найдена.🙄")
         return
 
     # 2. Удаляем задачу из БД
@@ -451,9 +463,9 @@ async def cmd_delete(message: Message, command: CommandObject):
 
 @router.callback_query(F.data == "list_all")
 async def cb_list_all(call: CallbackQuery):
-    """Показывает ВСЕ задачи, КРОМЕ утренних (morning)"""
+    """Показывает ВСЕ задачи, КРОМЕ утренних (morning), редактируя текущее сообщение"""
     await call.answer()
-    await send_task_list(call.message, exclude_type="morning", use_close_keyboard=True)
+    await send_task_list(call.message, exclude_type="morning", edit=True)
 
 
 @router.callback_query(F.data == "close_message")
@@ -490,7 +502,7 @@ async def cmd_test_backup(message: Message):
             rows = await cur.fetchall()
             
     if not rows:
-        await message.answer(f"📊 <b>Тест бэкапа:</b>\n\nВ прошлом месяце не было выполненных утренних задач.", parse_mode="HTML")
+        await message.answer(f"📊 <b>Тест бэкапа:</b>\n\nВ прошлом месяце не было выполненных утренних задач.🙄", parse_mode="HTML")
         return
         
     text = f"📊 <b>Тест отчета за {first_day_last_month.strftime('%B %Y')}:</b>\n\n"

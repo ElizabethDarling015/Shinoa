@@ -87,7 +87,7 @@ async def cb_idea_all(call: CallbackQuery, state: FSMContext):
     items = await db.get_recent_items(call.message.chat.id, limit=20)
     
     if not items:
-        text = "📂 <b>Архив пуст</b>\n\nУ тебя пока нет сохраненных заметок или идей."
+        text = "📂 <b>Архив пуст</b>\n\nУ тебя пока нет сохраненных заметок или идей.🙄"
         try:
             await call.message.edit_text(text, parse_mode="HTML", reply_markup=get_idea_nav_keyboard())
         except Exception as e:
@@ -139,7 +139,7 @@ async def cb_view_item(call: CallbackQuery):
     item = await db.get_item_by_id(item_id, call.message.chat.id)
     
     if not item:
-        await call.answer("⚠️ Заметка не найдена или была удалена", show_alert=True)
+        await call.answer("⚠️ Заметка не найдена или была удалена🙄", show_alert=True)
         return
 
     emoji = TYPE_EMOJI.get(item["type"], "📌")
@@ -200,7 +200,7 @@ async def cb_delete_item(call: CallbackQuery):
             keyboard.inline_keyboard.extend(get_idea_nav_keyboard().inline_keyboard)
             await call.message.edit_text("\n".join(parts), parse_mode="HTML", reply_markup=keyboard)
     else:
-        await call.answer("⚠️ Ошибка: заметка не найдена или уже удалена", show_alert=True)
+        await call.answer("⚠️ Ошибка: заметка не найдена или уже удалена🙄", show_alert=True)
 
 
 # ──────────────────────────────────────────────────────────
@@ -410,7 +410,7 @@ async def cmd_find(message: Message):
     )
 
     if not items:
-        await message.answer(f"🔍 По запросу «{query}» ничего не найдено.")
+        await message.answer(f"🔍 По запросу «{query}» ничего не найдено.🙄")
         return
 
     parts_msg = [f"🔍 <b>Найдено: {len(items)}</b>\n"]
