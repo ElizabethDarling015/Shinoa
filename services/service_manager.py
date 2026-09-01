@@ -58,6 +58,24 @@
    запуск/пауза/резюм/остановка сразу пишет полный снимок активных потоков
    в registry.json (STATUS_DIR) — pid, пути к status.json/.log, команда
    запуска (для проверки от переиспользования pid), chat_id (куда слать
+
+3. Процесс запускается через СИНХРОННЫЙ subprocess.Popen, а не через
+   asyncio.create_subprocess_exec. Это принципиально, не стилистика:
+   объект asyncio.subprocess.Process оборачивает asyncio-транспорт, и у
+   этого транспорта есть задокументированное поведение — при уничтожении
+   (close()/сборка мусора), если процесс ещё жив, он сам посылает ему
+   SIGKILL (защита asyncio от "утекших" дочерних процессов). Раньше здесь
+   был asyncio.create_subprocess_exec + отдельная asyncio-задача, которая
+   через await process.wait() держала этот объект живым "для порядка, чтобы
+   не плодить зомби" — и именно это оказалось причиной реального бага: при
+   остановке Shinoa (даже с KillMode=process в systemd, даже с успешным
+   start_new_session) asyncio.run() в самом конце отменяет все ещё висящие
+   задачи, включая эту; единственная ссылка на объект-транспорт исчезает,
+   Python тут же его собирает, деструктор видит "процесс ещё жив" — и убивает
+   его SIGKILL'ом, никак не заботясь о сессиях/группах процессов, потому что
+   это прямой kill(pid) изнутри интерпретатора, а не сигнал от ОС/systemd.
+   У обычного subprocess.Popen такого поведения при сборке мусора нет —
+   поэтому именно он используется здесь, а не asyncio-обёртка.
    уведомления) и параметры. При старте bot.py вызывает recover() (см.
    ниже и handlers/services_control.recover_services): для каждой записи
    реестра проверяется, жив ли ещё процесс с этим pid (и что это точно ОН,
@@ -84,6 +102,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -112,9 +131,17 @@ def _runs(service_id: str) -> dict[int, dict]:
     return _running.setdefault(service_id, {})
 
 
-def _is_pid_alive(pid: int) -> bool:
-    """kill(pid, 0) ничего не убивает — только проверяет, существует ли процесс
-    и есть ли у нас права его сигналить (для наших же детей всегда есть)."""
+def _is_pid_alive(pid: int, local_process: subprocess.Popen | None = None) -> bool:
+    """
+    Если процесс был запущен НАМИ в этой сессии (local_process передан) —
+    проверяем и заодно "пожинаем" через Popen.poll() (не блокирует, просто
+    неблокирующий os.waitpid внутри) — иначе, доживи он до превращения в
+    зомби, будет висеть в таблице процессов до перезапуска Shinoa.
+    Для "усыновлённых" после restart потоков (local_process нет — это уже
+    не наш ребёнок, waitpid на чужой pid не сработает) — просто kill(pid, 0).
+    """
+    if local_process is not None:
+        return local_process.poll() is None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -151,8 +178,8 @@ def is_running(service_id: str, run_id: int = None) -> bool:
     runs = _runs(service_id)
     if run_id is not None:
         entry = runs.get(run_id)
-        return bool(entry and _is_pid_alive(entry["pid"]))
-    return any(_is_pid_alive(e["pid"]) for e in runs.values())
+        return bool(entry and _is_pid_alive(entry["pid"], entry.get("local_process")))
+    return any(_is_pid_alive(e["pid"], e.get("local_process")) for e in runs.values())
 
 
 def is_paused(service_id: str, run_id: int) -> bool:
@@ -293,23 +320,28 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
     # Вывод (stdout/stderr) дочернего процесса пишем в .log рядом со status.json,
     # а не глушим в DEVNULL — иначе при зависании/падении без внятного "error"
     # в status.json диагностировать причину было бы невозможно.
+    #
+    # ВАЖНО: сознательно subprocess.Popen, а не asyncio.create_subprocess_exec —
+    # см. большой комментарий в шапке файла (пункт 3) про то, почему asyncio-
+    # обёртка сама убивала процесс SIGKILL'ом при остановке Shinoa. Сам вызов
+    # Popen() синхронный, но не блокирует событийный цикл сколько-нибудь заметно
+    # (это просто fork+exec, микросекунды-миллисекунды) — гонять его через
+    # run_in_executor ради этого избыточно.
     log_fh = open(log_file, "wb")
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
+    process = subprocess.Popen(
+        cmd,
         cwd=cfg.get("cwd"),
         stdout=log_fh,
-        stderr=asyncio.subprocess.STDOUT,
-        start_new_session=True,  # см. большой комментарий в шапке файла
+        stderr=subprocess.STDOUT,
+        start_new_session=True,  # см. большой комментарий в шапке файла, пункт 1
     )
-    # Только чтобы не плодить зомби-процессы среди СВОИХ прямых детей — на
-    # логику сервиса это не влияет, статус мы всё равно узнаём из status.json.
-    asyncio.create_task(_reap_zombie(process))
 
     watcher_task = asyncio.create_task(
-        _watch(service_id, run_id, status_file, process.pid, on_update, poll_seconds)
+        _watch(service_id, run_id, status_file, process.pid, on_update, poll_seconds, local_process=process)
     )
     _runs(service_id)[run_id] = {
         "pid": process.pid,
+        "local_process": process,  # только для _is_pid_alive/poll() — не сериализуется в registry.json
         "status_file": status_file,
         "log_file": log_file,
         "log_fh": log_fh,
@@ -324,25 +356,35 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
     return run_id
 
 
-async def _reap_zombie(process: "asyncio.subprocess.Process") -> None:
-    try:
-        await process.wait()
-    except Exception:
-        pass
-
-
-async def _watch(service_id: str, run_id: int, status_file: Path, pid: int, on_update, poll_seconds: float = 30.0):
+async def _watch(service_id: str, run_id: int, status_file: Path, pid: int, on_update,
+                  poll_seconds: float = 30.0, local_process: subprocess.Popen | None = None):
     """
     Каждые poll_seconds читает status.json и зовёт on_update(run_id, status).
-    Живость процесса проверяется через os.kill(pid, 0) — единообразно для
-    свежезапущенных потоков и для "воскрешённых" после перезапуска Shinoa
-    (у вторых просто нет объекта asyncio.subprocess.Process, которым можно
-    было бы явно await'ить, — это уже не наши дети, их усыновил init).
+    Живость процесса проверяется через _is_pid_alive — единообразно для
+    свежезапущенных потоков (с local_process — заодно неблокирующе "пожинает"
+    завершившегося) и для "воскрешённых" после перезапуска Shinoa (без
+    local_process — это уже не наши дети, их усыновил init, только kill(pid,0)).
+
+    ВАЖНО про CancelledError: эта задача отменяется в ДВУХ принципиально
+    разных случаях, и путать их нельзя.
+    1. Поток реально сняли через stop() — тот САМ уже почистил _running и
+       registry.json ДО отмены этой задачи, тут дополнительно делать нечего.
+    2. Останавливается сама Shinoa — asyncio.run() при выходе отменяет вообще
+       все ещё живые задачи, включая эту, хотя дочерний процесс (благодаря
+       subprocess.Popen, см. шапку файла) в этот момент прекрасно жив и
+       продолжит работать дальше сам по себе. Если бы тут, как раньше, единый
+       finally безусловно убирал запись из _running и перезаписывал
+       registry.json — на диске остался бы реестр БЕЗ этого потока, то есть
+       ровно тот случай, который recover() при следующем старте не может
+       найти. Поэтому при отмене мы НИЧЕГО не чистим и не трогаем диск —
+       запись должна остаться как есть, чтобы её нашли при следующем запуске.
+    Из _running/registry запись убирается только при ЕСТЕСТВЕННОМ завершении
+    цикла ниже (поток реально закончился/пропал) — то есть в ветке else.
     """
     def _read():
         return _read_status_file(status_file)
 
-    try:
+    async def _loop():
         while True:
             await asyncio.sleep(poll_seconds)
 
@@ -352,7 +394,7 @@ async def _watch(service_id: str, run_id: int, status_file: Path, pid: int, on_u
             if data is not None and data.get("status") in ("done", "error"):
                 return
 
-            if not _is_pid_alive(pid):
+            if not _is_pid_alive(pid, local_process):
                 # Процесс исчез, не оставив финального статуса — падение,
                 # OOM-killer, или его убили вместе с Shinoa (если Ctrl+C/
                 # systemd всё же дотянулись до него, см. шапку файла).
@@ -366,9 +408,15 @@ async def _watch(service_id: str, run_id: int, status_file: Path, pid: int, on_u
                 if on_update:
                     await on_update(run_id, data)
                 return
+
+    try:
+        await _loop()
     except asyncio.CancelledError:
         raise
-    finally:
+    else:
+        # Сюда попадаем, только если _loop() завершилась сама (return изнутри
+        # неё), а не была отменена снаружи — то есть поток реально закончился
+        # или пропал. Только теперь безопасно чистить _running и диск.
         entry = _runs(service_id).pop(run_id, None)
         if entry and entry.get("log_fh"):
             try:
@@ -384,8 +432,9 @@ async def stop(service_id: str, run_id: int) -> bool:
     if not entry:
         return False
     pid = entry["pid"]
+    local_process = entry.get("local_process")
     watcher_task = entry["watcher_task"]
-    if _is_pid_alive(pid):
+    if _is_pid_alive(pid, local_process):
         if entry.get("paused"):
             # замороженный SIGSTOP-ом процесс не реагирует на SIGTERM,
             # его сначала нужно разбудить SIGCONT, иначе он зависнет намертво
@@ -404,7 +453,7 @@ async def stop(service_id: str, run_id: int) -> bool:
         # ~1 сек каждая) и генерация HTML-отчёта. 10 секунд было мало —
         # убивали SIGKILL'ом прямо посреди этого, отчёт не успевал сформироваться.
         for _ in range(120):  # ~60 секунд
-            if not _is_pid_alive(pid):
+            if not _is_pid_alive(pid, local_process):
                 break
             await asyncio.sleep(0.5)
         else:
@@ -425,7 +474,7 @@ async def stop(service_id: str, run_id: int) -> bool:
 
 def pause(service_id: str, run_id: int) -> bool:
     entry = _runs(service_id).get(run_id)
-    if not entry or not _is_pid_alive(entry["pid"]):
+    if not entry or not _is_pid_alive(entry["pid"], entry.get("local_process")):
         return False
     try:
         os.kill(entry["pid"], signal.SIGSTOP)
@@ -438,7 +487,7 @@ def pause(service_id: str, run_id: int) -> bool:
 
 def resume(service_id: str, run_id: int) -> bool:
     entry = _runs(service_id).get(run_id)
-    if not entry or not _is_pid_alive(entry["pid"]):
+    if not entry or not _is_pid_alive(entry["pid"], entry.get("local_process")):
         return False
     try:
         os.kill(entry["pid"], signal.SIGCONT)
@@ -486,6 +535,7 @@ async def recover(on_update_factory) -> list[tuple[str, int, str]]:
             watcher_task = asyncio.create_task(_watch(service_id, run_id, status_file, pid, on_update))
             _runs(service_id)[run_id] = {
                 "pid": pid,
+                "local_process": None,  # не наш ребёнок в этой сессии — усыновлён init'ом
                 "status_file": status_file,
                 "log_file": Path(entry["log_file"]),
                 "log_fh": None,  # не наш дескриптор — процесс пишет в него сам
