@@ -4,6 +4,7 @@
 
 import logging
 from datetime import datetime
+from html import escape
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton

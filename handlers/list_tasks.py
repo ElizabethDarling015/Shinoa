@@ -9,6 +9,7 @@ import logging
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from html import escape
 
 import database as db
 from handlers.common import WEEKDAY_LABELS
