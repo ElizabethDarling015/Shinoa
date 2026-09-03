@@ -45,7 +45,7 @@ class ServiceSettingsInput(StatesGroup):
 
 def _footer_description(cfg: dict) -> str:
     if cfg.get("settings"):
-        settings_line = "⚙️ <b>Настройки</b> — Дополнительные параметры для новых потоков."
+        settings_line = "⚙️ <b>Настройки</b> — Настройки для новых потоков."
     else:
         settings_line = "⚙️ <b>Настройки</b> — параметры этого сервиса (пока нет ни одной)"
     return f"{settings_line}\n🧪 <b>Тест</b> — Быстрый сбор за 2 минуты."
@@ -162,7 +162,10 @@ def _progress_line(status: dict | None) -> str:
 
 
 def _fmt_duration(seconds) -> str | None:
-    """Компактный формат длительности: '3ч20м', '3ч', '45м'. None, если данных нет."""
+    """Компактный формат длительности: '3ч20м', '3ч', '45м'. None, если данных нет.
+    Намеренно без символа '<' — при parse_mode='HTML' Telegram пытается разобрать
+    его как начало тега ('<1м' → незакрытый тег '1м') и роняет ЛЮБОЕ сообщение,
+    где эта строка встретится, ошибкой 'Unsupported start tag'."""
     if seconds is None:
         return None
     try:
@@ -173,7 +176,7 @@ def _fmt_duration(seconds) -> str | None:
     minutes = rem // 60
     if hours >= 1:
         return f"{hours}ч{minutes:02d}м" if minutes else f"{hours}ч"
-    return f"{minutes}м" if minutes else "<1м"
+    return f"{minutes}м" if minutes else "≈0м"
 
 
 def _thread_label(service_id: str, run_id: int) -> str:
@@ -317,7 +320,7 @@ def _card_text(service_id: str, cfg: dict) -> str:
             else:
                 time_str = "старт"
 
-            head = f"{dot} {i}. {html.escape(str(title))}. ({time_str}). {percent_str}"
+            head = f"{dot} <b>{i}. {html.escape(str(title))}</b>. ({time_str}). {percent_str}"
             block_lines = [head] + _run_settings_lines(service_id, rid, cfg) + [f"<code>{html.escape(url)}</code>"]
             blocks.append("\n".join(block_lines))
         body = "\n\n".join(blocks)

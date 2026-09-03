@@ -256,7 +256,13 @@ def set_setting(service_id: str, key: str, value: str | None) -> None:
 
 def _build_command(service_id: str, cfg: dict, params: dict, status_file: Path) -> list[str]:
     """Собирает командную строку запуска под конкретный сервис из реестра + параметры пользователя."""
-    cmd = [cfg["python"], cfg["entry"], cfg["command"]]
+    # -u (unbuffered) — без него print() в дочернем процессе буферизуется
+    # блоками, когда вывод идёт не в терминал, а в файл (наш .log): свежие
+    # строки могут не долетать до диска по несколько минут, хотя процесс
+    # уже давно их напечатал — реально работающий поток выглядит "зависшим"
+    # при просмотре через tail -f. status.json это не касалось (он и так
+    # переоткрывается на каждую запись), но .log вводил в заблуждение.
+    cmd = [cfg["python"], "-u", cfg["entry"], cfg["command"]]
 
     input_kind = cfg.get("input_kind", "none")
     if input_kind == "url_hours":
