@@ -46,7 +46,7 @@ async def get_tasks(chat_id: int, category: str = None, priority: str = None, ex
     if exclude_type:
         query += " AND type != ?"
         params.append(exclude_type)
-    
+
     # НОВОЕ: Фильтрация по конкретному типу задачи
     if task_type:
         query += " AND type = ?"
@@ -60,7 +60,7 @@ async def get_tasks(chat_id: int, category: str = None, priority: str = None, ex
         params.append(priority)
 
     query += " ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, id"
-    
+
     async with get_db() as db:
         async with db.execute(query, params) as cur:
             rows = await cur.fetchall()
@@ -122,13 +122,13 @@ async def get_stats(chat_id: int) -> dict:
 
 async def get_monthly_morning_tasks(chat_id: int) -> list[dict]:
     """
-    Получает утренние задачи (type='morning'). 
+    Получает утренние задачи (type='morning').
     Сортируем по ID DESC (новые сверху), чтобы избежать ошибок, если колонки created_at нет.
     """
     async with get_db() as db:
         async with db.execute(
             """
-            SELECT * FROM tasks 
+            SELECT * FROM tasks
             WHERE chat_id = ? AND type = 'morning'
             ORDER BY id DESC
             LIMIT 30
@@ -137,3 +137,29 @@ async def get_monthly_morning_tasks(chat_id: int) -> list[dict]:
         ) as cur:
             rows = await cur.fetchall()
             return [dict(row) for row in rows]
+
+
+async def get_todays_morning_tasks(chat_id: int, created_before: str) -> list[dict]:
+    """
+    Активные morning-задачи, относящиеся к «сегодня»: созданные СТРОГО РАНЬШЕ
+    полуночи сегодняшнего дня по локальному времени пользователя
+    (то есть вчера или ранее — они должны прийти сегодня утром).
+
+    created_before — строка 'YYYY-MM-DD HH:MM:SS' в UTC
+    (момент «полночь сегодня по локальному таймзону», конвертированный в UTC).
+
+    Задачи, созданные сегодня (＝ «на завтра»), в выборку НЕ попадают —
+    завтра они появятся здесь автоматически.
+    """
+    query = """
+        SELECT * FROM tasks
+        WHERE chat_id = ?
+          AND status = 'active'
+          AND type = 'morning'
+          AND created_at < ?
+        ORDER BY id DESC
+    """
+    async with get_db() as db:
+        async with db.execute(query, (chat_id, created_before)) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]

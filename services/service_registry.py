@@ -57,30 +57,9 @@ SERVICES = {
             ),
             "hours": "⏱ На сколько часов запускаем сбор? Просто число, например <code>6</code>",
         },
-        "settings": [
-            {
-                "key": "proxy",
-                "label": "🌐 Прокси",
-                "prompt": (
-                    "Пришли адрес прокси для новых потоков этого сервиса, например:\n"
-                    "<code>http://user:pass@host:port</code> или <code>socks5://host:port</code>\n\n"
-                    "Отправь «-», чтобы убрать прокси и снова ходить напрямую."
-                ),
-                "cli_flag": "--proxy",
-            },
-            {
-                "key": "cookies",
-                "label": "🍪 Куки",
-                "prompt": (
-                    "Пришли содержимое cookie-файла для новых потоков этого сервиса — "
-                    "тот же формат, что в <code>session_cookies.txt</code> (зайди на playerok.com "
-                    "в браузере под нужным аккаунтом/сессией и скопируй куки оттуда).\n\n"
-                    "Отправь «-», чтобы вернуться к стандартному session_cookies.txt."
-                ),
-                "cli_flag": "--cookies-file",
-                "is_file_content": True,
-            },
-        ],
+        "use_proxy_pool": True,  # прокси+куки идут парами через пул (см. proxy_pairs.py,
+                                  # service_manager.MAX_THREADS_PER_PAIR), а не как одиночные
+                                  # настройки — см. обсуждение про DataDome/угон сессии.
     },
     # Пример будущей записи (Avito) — раскомментировать и добавить AVITO_* в .env, когда будет готов:
     # "avito": {

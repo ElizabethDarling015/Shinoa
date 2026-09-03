@@ -5,13 +5,16 @@
 """
 
 import logging
+from datetime import datetime
 
+import pytz
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from html import escape
 
 import database as db
+from config import DEFAULT_TIMEZONE
 from handlers.common import WEEKDAY_LABELS
 
 logger = logging.getLogger(__name__)
@@ -40,7 +43,7 @@ PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 # ──────────────────────────────────────────────────────────
 # Хранение параметров последних сообщений со списками задач
 # ──────────────────────────────────────────────────────────
-last_list_messages = {} 
+last_list_messages = {}
 
 
 def get_list_nav_keyboard() -> InlineKeyboardMarkup:
@@ -87,16 +90,21 @@ def get_task_categories_keyboard() -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "tasks_menu:today")
 async def cb_tasks_today(call: CallbackQuery):
-    """Показывает утренние задачи на сегодня ОТДЕЛЬНЫМИ сообщениями с кнопками"""
+    """Показывает утренние задачи НА СЕГОДНЯ отдельными сообщениями с кнопками.
+
+    Исправлено: не показывает «завтрашние» morning-задачи (созданные сегодня).
+    «Сегодня» определяется по локальному часовому поясу пользователя:
+    в выборку попадают только morning-задачи, созданные СТРОГО РАНЬШЕ
+    сегодняшней локальной полуночи.
+    """
     await call.answer()
-    
     kb_nav = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⬅️ В категорию", callback_data="start_list"),
             InlineKeyboardButton(text="🏠 На главную", callback_data="start_main")
         ]
     ])
-    
+
     try:
         await call.message.edit_text(
             "⏳ Отправляю сегодняшние задачи👇",
@@ -107,8 +115,25 @@ async def cb_tasks_today(call: CallbackQuery):
         if "message is not modified" not in str(e).lower():
             pass
 
-    tasks = await db.get_tasks(call.message.chat.id, task_type="morning")
-    
+    # ── Определяем границу «полночь сегодня» по локальному таймзону ──
+    user = await db.get_user(call.message.chat.id)
+    tz_name = (user or {}).get("timezone") or DEFAULT_TIMEZONE
+    try:
+        tz = pytz.timezone(tz_name)
+    except Exception:
+        tz = pytz.timezone(DEFAULT_TIMEZONE)
+
+    now_local = datetime.now(tz)
+    midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight_utc = midnight_local.astimezone(pytz.UTC)
+    created_before = midnight_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Получаем только morning-задачи, созданные ДО сегодняшней локальной полуночи
+    tasks = await db.get_todays_morning_tasks(
+        call.message.chat.id,
+        created_before=created_before,
+    )
+
     if not tasks:
         await call.message.answer(
             "📅 На сегодня утренних задач нет. Отличный повод отдохнуть или добавить новую! ☕",
@@ -142,7 +167,7 @@ async def cb_task_action(call: CallbackQuery):
             await call.message.delete()
         except Exception as e:
             logger.warning(f"Не удалось скрыть сообщение: {e}")
-            
+
     elif action == "del":
         task = await db.get_task(task_id)
         if task and task["chat_id"] == chat_id:
@@ -150,7 +175,7 @@ async def cb_task_action(call: CallbackQuery):
             await db.delete_task(task_id, chat_id)
             if _scheduler:
                 _scheduler.remove_all_for_task(schedule_ids)
-                
+
         await call.answer("🗑 Задача удалена навсегда!", show_alert=True)
         try:
             await call.message.delete()
@@ -164,18 +189,18 @@ async def cb_task_action(call: CallbackQuery):
             async with get_db() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO completed_tasks (original_task_id, chat_id, title, text, category, priority) 
+                    INSERT INTO completed_tasks (original_task_id, chat_id, title, text, category, priority)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (task_id, chat_id, task['title'], task.get('text'), task['category'], task['priority'])
                 )
                 await conn.commit()
-            
+
             schedule_ids = await db.delete_schedules_for_task(task_id)
             await db.delete_task(task_id, chat_id)
             if _scheduler:
                 _scheduler.remove_all_for_task(schedule_ids)
-                
+
         await call.answer("✅ Задача выполнена и перенесена в архив!", show_alert=True)
         try:
             await call.message.delete()
@@ -431,7 +456,7 @@ async def cmd_delete(message: Message, command: CommandObject):
     # 3. Пересобираем список и обновляем сообщение
     if message.chat.id in last_list_messages:
         msg_data = last_list_messages[message.chat.id]
-        
+
         # Генерируем новый текст списка (задача уже удалена из БД, её не будет в тексте)
         if msg_data.get("type") == "category":
             new_text = await _build_category_text(message.chat.id, msg_data.get("category"))
@@ -442,10 +467,10 @@ async def cmd_delete(message: Message, command: CommandObject):
                 priority=msg_data.get("priority"),
                 exclude_type=msg_data.get("exclude_type")
             )
-            
+
         # Добавляем уведомление об успешном удалении
         new_text += "\n\n✅ <b>Удалила указанную задачу😌</b>"
-        
+
         try:
             await message.bot.edit_message_text(
                 chat_id=message.chat.id,
@@ -457,7 +482,7 @@ async def cmd_delete(message: Message, command: CommandObject):
             return
         except Exception as e:
             logger.warning(f"Не удалось отредактировать сообщение (возможно, оно удалено): {e}")
-            
+
     # Fallback, если редактирование не удалось
     await message.answer(f"🗑 Задача <b>{task['title']}</b> удалена.", parse_mode="HTML")
 
@@ -493,24 +518,24 @@ async def cmd_test_backup(message: Message):
     first_day_last_month = last_day_last_month.replace(day=1)
 
     sql = """
-        SELECT title, category, priority, completed_at 
-        FROM completed_tasks 
+        SELECT title, category, priority, completed_at
+        FROM completed_tasks
         WHERE chat_id = ? AND date(completed_at) BETWEEN ? AND ?
         ORDER BY completed_at ASC
     """
     async with get_db() as conn:
         async with conn.execute(sql, (message.chat.id, first_day_last_month.isoformat(), last_day_last_month.isoformat())) as cur:
             rows = await cur.fetchall()
-            
+
     if not rows:
         await message.answer(f"📊 <b>Тест бэкапа:</b>\n\nВ прошлом месяце не было выполненных утренних задач.🙄", parse_mode="HTML")
         return
-        
+
     text = f"📊 <b>Тест отчета за {first_day_last_month.strftime('%B %Y')}:</b>\n\n"
     text += f"✅ Выполнено задач: <b>{len(rows)}</b>\n\n"
     for r in rows:
         text += f"• {r['title']} <i>({r['category']})</i>\n"
-        
+
     await message.answer(text, parse_mode="HTML")
 
 

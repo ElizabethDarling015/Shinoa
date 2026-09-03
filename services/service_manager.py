@@ -109,6 +109,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from services.service_registry import get_service
+from services import proxy_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +117,12 @@ STATUS_DIR = Path(tempfile.gettempdir()) / "shinoa_service_status"
 STATUS_DIR.mkdir(exist_ok=True)
 REGISTRY_FILE = STATUS_DIR / "registry.json"
 
+# Сколько активных потоков разрешено одновременно на одну пару прокси+куки
+# (см. proxy_pairs.py) — общий потолок для всех сервисов с пулом ресурсов.
+MAX_THREADS_PER_PAIR = 3
+
 # service_id -> {run_id: {"pid","status_file","log_file","log_fh","watcher_task",
-#                          "cmd","chat_id","params","started_at","paused"}}
+#                          "cmd","chat_id","params","started_at","paused","pair_id"}}
 _running: dict[str, dict[int, dict]] = {}
 # service_id -> следующий свободный run_id (растёт монотонно, не переиспользуется)
 _next_run_id: dict[str, int] = {}
@@ -212,6 +217,53 @@ def get_cmd(service_id: str, run_id: int) -> list | None:
     return entry["cmd"] if entry else None
 
 
+def get_pair_id(service_id: str, run_id: int) -> int | None:
+    """Какой парой прокси+куки (см. proxy_pairs.py) пользуется этот поток —
+    зафиксировано при старте, как и весь cmd. None — поток запущен без пары
+    (прямое соединение, дефолтные куки; так работает всё, что было до
+    появления пула прокси, и так же продолжает работать, если пар просто
+    ещё не завели ни одной)."""
+    entry = _runs(service_id).get(run_id)
+    return entry.get("pair_id") if entry else None
+
+
+def _active_pair_counts(service_id: str) -> dict:
+    """{pair_id: сколько сейчас активных потоков на ней}. Живость не проверяем
+    отдельно — запись в _running и так означает "поток либо жив, либо watcher
+    вот-вот сам её уберёт"; для распределения точность до долей секунды не нужна."""
+    counts: dict = {}
+    for entry in _runs(service_id).values():
+        pid = entry.get("pair_id")
+        if pid is not None:
+            counts[pid] = counts.get(pid, 0) + 1
+    return counts
+
+
+def pair_active_count(service_id: str, pair_id: int) -> int:
+    return _active_pair_counts(service_id).get(pair_id, 0)
+
+
+def pick_pair_for_new_thread(service_id: str) -> dict | None:
+    """
+    Наименее загруженная пара прокси+куки с ещё свободным местом (меньше
+    MAX_THREADS_PER_PAIR активных потоков) — при равной загрузке берём с
+    меньшим id (детерминированно, а не случайно). Возвращает None в двух
+    разных по смыслу случаях, которые разбирает вызывающая сторона (start()):
+    пар нет вообще (значит пул просто не настроен — работаем без прокси, как
+    раньше) или все имеющиеся пары заняты под завязку (значит нужно явно
+    отказать в запуске, а не тихо пойти напрямую в обход лимита).
+    """
+    pairs = proxy_pairs.get_pairs(service_id)
+    if not pairs:
+        return None
+    counts = _active_pair_counts(service_id)
+    free = [p for p in pairs if counts.get(p["id"], 0) < MAX_THREADS_PER_PAIR]
+    if not free:
+        return None
+    free.sort(key=lambda p: (counts.get(p["id"], 0), p["id"]))
+    return free[0]
+
+
 def _read_status_file(status_file: Path) -> dict | None:
     try:
         return json.loads(status_file.read_text(encoding="utf-8"))
@@ -254,7 +306,23 @@ def set_setting(service_id: str, key: str, value: str | None) -> None:
     tmp.replace(f)
 
 
-def _build_command(service_id: str, cfg: dict, params: dict, status_file: Path) -> list[str]:
+def get_test_mode(service_id: str) -> str:
+    """
+    'standard' (по умолчанию) — обычный 2-минутный тест, как было всегда.
+    'additional' — та же 2-минутная длительность, но с флагом --diagnostic,
+    который парсер использует под текущую гипотезу, которую сейчас проверяем
+    (см. Настройки → Режим тестирования) — изолированный "лабораторный" путь,
+    ошибка в котором не может уронить настоящий сбор, только этот тестовый.
+    """
+    return get_settings(service_id).get("test_mode", "standard")
+
+
+def set_test_mode(service_id: str, mode: str) -> None:
+    set_setting(service_id, "test_mode", mode)
+
+
+def _build_command(service_id: str, cfg: dict, params: dict, status_file: Path,
+                    proxy: str = None, cookies_file: str = None) -> list[str]:
     """Собирает командную строку запуска под конкретный сервис из реестра + параметры пользователя."""
     # -u (unbuffered) — без него print() в дочернем процессе буферизуется
     # блоками, когда вывод идёт не в терминал, а в файл (наш .log): свежие
@@ -276,12 +344,30 @@ def _build_command(service_id: str, cfg: dict, params: dict, status_file: Path) 
         cmd += [str(params["number"])]
     # "none" — без доп. параметров
 
+    if params.get("start_at"):
+        # Отложенный старт (см. handlers/services_control.py) — процесс
+        # запускается сразу, но сам сбор откладывает внутри себя до этого
+        # момента (main.py). ISO-строка в UTC.
+        cmd += ["--start-at", params["start_at"]]
+
     cmd += ["--status-file", str(status_file)]
 
-    # Настройки сервиса (прокси/куки и т.п., см. service_registry.py) —
-    # общие для всех НОВЫХ потоков этого сервиса, пока не поменяешь ещё раз
-    # через "⚙️ Настройки". Пункты, для которых ничего не задано, просто не
-    # добавляют флаг — сервис получит своё поведение по умолчанию.
+    if params.get("diagnostic"):
+        # Режим тестирования "Дополнительный" (см. Настройки) — та же
+        # длительность (--test уже добавлен выше), но с флагом, который
+        # включает в парсере изолированный "лабораторный" код для проверки
+        # текущей гипотезы — см. main.py/collector.py, ветка diagnostic.
+        cmd += ["--diagnostic"]
+
+    if proxy:
+        cmd += ["--proxy", proxy]
+    if cookies_file:
+        cmd += ["--cookies-file", cookies_file]
+
+    # Старый общий механизм настроек (service_registry.py: "settings") — для
+    # сервисов БЕЗ пула прокси/кук (use_proxy_pool), простые одиночные поля.
+    # У Playerok сейчас этот список пуст — прокси/куки там идут через пары
+    # (proxy/cookies_file выше), а не через это.
     settings = get_settings(service_id)
     for field in cfg.get("settings", []):
         value = settings.get(field["key"])
@@ -312,6 +398,7 @@ def _dump_registry() -> None:
                 "params": entry["params"],
                 "started_at": entry["started_at"],
                 "paused": entry["paused"],
+                "pair_id": entry.get("pair_id"),
             }
     tmp = REGISTRY_FILE.with_suffix(".json.tmp")
     try:
@@ -350,6 +437,21 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
     run_id = _next_run_id.get(service_id, 1)
     _next_run_id[service_id] = run_id + 1
 
+    # Пул прокси+куки (см. proxy_pairs.py) — включается флагом use_proxy_pool
+    # в service_registry.py. Если пар не заведено ни одной — работаем как
+    # раньше, без прокси, дефолтные куки. Если пары есть, но ВСЕ уже заняты
+    # (MAX_THREADS_PER_PAIR на каждую) — явно отказываем, а не тихо превышаем
+    # лимит или уходим в обход пула напрямую: смысл лимита именно в том,
+    # чтобы его не нарушать молча.
+    pair = None
+    if cfg.get("use_proxy_pool"):
+        pair = pick_pair_for_new_thread(service_id)
+        if pair is None and proxy_pairs.get_pairs(service_id):
+            raise ServiceError(
+                f"Все пары прокси+куки заняты (по {MAX_THREADS_PER_PAIR} потока на каждую) — "
+                "добавь ещё пару в настройках или дождись, пока какой-то поток освободит место"
+            )
+
     stamp = int(time.time())
     status_file = STATUS_DIR / f"{service_id}_{run_id}_{stamp}.json"
     log_file = STATUS_DIR / f"{service_id}_{run_id}_{stamp}.log"
@@ -369,8 +471,13 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
         "error": None,
     }), encoding="utf-8")
 
-    cmd = _build_command(service_id, cfg, params, status_file)
-    logger.info("Запускаю сервис %s (поток #%d): %s", service_id, run_id, " ".join(cmd))
+    cmd = _build_command(
+        service_id, cfg, params, status_file,
+        proxy=pair["proxy"] if pair else None,
+        cookies_file=pair["cookies_file"] if pair else None,
+    )
+    logger.info("Запускаю сервис %s (поток #%d%s): %s", service_id, run_id,
+                f", пара #{pair['id']}" if pair else "", " ".join(cmd))
 
     # Вывод (stdout/stderr) дочернего процесса пишем в .log рядом со status.json,
     # а не глушим в DEVNULL — иначе при зависании/падении без внятного "error"
@@ -402,6 +509,7 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
         "log_fh": log_fh,
         "cmd": cmd,
         "chat_id": chat_id,
+        "pair_id": pair["id"] if pair else None,
         "on_update": on_update,  # нужен stop()'у для досрочной доставки результата, см. stop()
         "watcher_task": watcher_task,
         "params": params,
@@ -648,6 +756,7 @@ async def recover(on_update_factory) -> list[tuple[str, int, str]]:
                 "params": entry["params"],
                 "started_at": entry["started_at"],
                 "paused": entry.get("paused", False),
+                "pair_id": entry.get("pair_id"),
             }
             _next_run_id[service_id] = max(_next_run_id.get(service_id, 1), run_id + 1)
             logger.info("Восстановлена связь с потоком %s #%d (pid=%d)", service_id, run_id, pid)

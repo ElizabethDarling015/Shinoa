@@ -68,7 +68,7 @@ async def cb_goodbye_close(call: CallbackQuery):
             pass
     except Exception as e:
         logger.warning("Не удалось удалить прощальное сообщение: %s", e)
-    
+
     try:
         await call.answer()
     except TelegramBadRequest:
@@ -187,7 +187,7 @@ async def main():
             BotCommand(command="settimezone", description="Часовой пояс"),
             BotCommand(command="digesttime", description="Время сводки"),
         ]
-        
+
         # 1. Очищаем глобальные команды и глобальную кнопку меню
         try:
             await bot.delete_my_commands(scope=BotCommandScopeDefault())
@@ -201,7 +201,7 @@ async def main():
             try:
                 await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=user_id))
                 await bot.set_chat_menu_button(
-                    chat_id=user_id, 
+                    chat_id=user_id,
                     menu_button=MenuButtonCommands()
                 )
                 logger.info(f"Команды и кнопка 'Меню' установлены для пользователя {user_id} ✅")
@@ -210,6 +210,8 @@ async def main():
 
     # ──────────────────────────────────────────
     # Глобальный обработчик ошибок
+    # ИСПРАВЛЕНО: теперь отвечает и на ошибки от inline-кнопок
+    # (callback_query), где event.update.message == None.
     # ──────────────────────────────────────────
     @dp.errors
     async def on_error(event: types.ErrorEvent, bot: Bot):
@@ -222,11 +224,19 @@ async def main():
 
         logger.exception("Unhandled error in update: %s", event.exception)
 
-        if event.update.message:
+        target_message = None
+        if event.update is not None:
+            if event.update.message is not None:
+                target_message = event.update.message
+            elif event.update.callback_query is not None:
+                target_message = event.update.callback_query.message
+
+        if target_message is not None:
             try:
-                await event.update.message.answer(
-                    "⚠️ Произошла ошибка. Попробуй позже или /start.",
-                    reply_markup=types.ReplyKeyboardRemove(),
+                # Без ReplyKeyboardRemove, чтобы случайно не сносить
+                # основную reply-клавиатуру меню при ошибке.
+                await target_message.answer(
+                    "⚠️ Произошла ошибка. Попробуй позже или /start."
                 )
             except Exception as e:
                 logger.error("Не удалось отправить сообщение об ошибке: %s", e)

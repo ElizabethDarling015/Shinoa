@@ -20,6 +20,8 @@ import asyncio
 import logging
 import html
 import os
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -29,6 +31,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from services.service_registry import get_service, list_services
 from services import service_manager as mgr
+from services import proxy_pairs
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -37,14 +40,20 @@ router = Router()
 class ServiceInput(StatesGroup):
     waiting_url = State()
     waiting_hours = State()
+    waiting_start_time = State()  # только для отложенного старта, см. cb_svc_start_delayed
 
 
 class ServiceSettingsInput(StatesGroup):
     waiting_value = State()
 
 
+class PairInput(StatesGroup):
+    waiting_proxy = State()
+    waiting_cookies = State()
+
+
 def _footer_description(cfg: dict) -> str:
-    if cfg.get("settings"):
+    if cfg.get("settings") or cfg.get("use_proxy_pool"):
         settings_line = "⚙️ <b>Настройки</b> — Настройки для новых потоков."
     else:
         settings_line = "⚙️ <b>Настройки</b> — параметры этого сервиса (пока нет ни одной)"
@@ -91,6 +100,43 @@ def _find_thread_viewer(service_id: str, run_id: int) -> tuple[int, int, bool] |
 
 _background_tasks: set = set()
 _hiding_runs: set = set()  # (service_id, run_id) — досрочно скрытые из списка на время остановки, см. _visible_runs
+
+# ──────────────────────────────────────────────────────────
+# Отложенный старт — "⏰ Отложенный старт" рядом с обычным запуском.
+# В отличие от первой версии, механизм живёт НЕ в памяти Shinoa, а внутри
+# самого запущенного процесса парсера (см. main.py, флаг --start-at): поток
+# запускается по-настоящему СРАЗУ (реальный OS-процесс, сразу занимает слот
+# в паре прокси — так же, как обычный поток, никакого отдельного лимита),
+# просто сам СБОР откладывает до нужного момента. Упади Shinoa хоть на всё
+# время ожидания — процессу всё равно, он ничего от неё не ждёт. Для Shinoa
+# это самый обычный поток с самого начала — виден в списке, останавливается
+# обычной кнопкой "Удалить поток", переживает recover() как любой другой.
+# ──────────────────────────────────────────────────────────
+
+_YEKAT_OFFSET = timedelta(hours=5)  # тот же дефолт часового пояса, что и везде в отчётах
+
+
+def _parse_start_time_to_utc(raw: str) -> datetime | None:
+    """'00:00' / '18:30' -> ближайший будущий момент в UTC (интерпретируя
+    введённое время как Екатеринбург, UTC+5) — сегодня, если ещё не наступило,
+    иначе завтра. None при некорректном формате."""
+    parts = raw.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hh, mm = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc + _YEKAT_OFFSET
+    target_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if target_local <= now_local:
+        target_local += timedelta(days=1)
+    return target_local - _YEKAT_OFFSET  # обратно в UTC
+
 def _fire_and_forget(coro) -> None:
     """
     Создаёт фоновую asyncio-задачу и, в отличие от голого asyncio.create_task(),
@@ -153,6 +199,8 @@ def _progress_line(status: dict | None) -> str:
         return "🟡 Запускается..."
     percent = status.get("progress_percent")
     ptext = status.get("progress_text")
+    if ptext and ptext.startswith("ожидание старта"):
+        return f"⏳ {html.escape(str(ptext))}"
     line = f"{dot} Собирается"
     if percent is not None:
         line += f": {percent}%"
@@ -179,6 +227,16 @@ def _fmt_duration(seconds) -> str | None:
     return f"{minutes}м" if minutes else "≈0м"
 
 
+def _fmt_start_at_short(start_at_iso: str) -> str:
+    """'2026-09-04T04:00:00+00:00' -> 'ждёт 09:00' (Екатеринбург, компактно для списка/кнопки)."""
+    try:
+        target_utc = datetime.fromisoformat(start_at_iso)
+    except ValueError:
+        return "ждёт старта"
+    local = target_utc + _YEKAT_OFFSET
+    return f"ждёт {local.strftime('%H:%M')}"
+
+
 def _thread_label(service_id: str, run_id: int) -> str:
     """
     Однострочная метка потока для кнопки в списке — вместо голого 'Поток N':
@@ -196,7 +254,9 @@ def _thread_label(service_id: str, run_id: int) -> str:
     dot = _status_dot(status, paused)
 
     if params.get("test"):
-        suffix = "test"
+        suffix = "test 🔬" if params.get("diagnostic") else "test"
+    elif params.get("start_at") and (status or {}).get("remaining_seconds") is None:
+        suffix = _fmt_start_at_short(params["start_at"])
     else:
         remaining = _fmt_duration((status or {}).get("remaining_seconds"))
         total = _fmt_duration((status or {}).get("total_seconds"))
@@ -245,6 +305,8 @@ def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMark
     else:
         rows.append([InlineKeyboardButton(text="▶️ Запустить", callback_data=f"svc_start:{service_id}")])
 
+    rows.append([InlineKeyboardButton(text="⏰ Отложенный старт", callback_data=f"svc_start_delayed:{service_id}")])
+
     rows.append([
         InlineKeyboardButton(text="⚙️ Настройки", callback_data=f"svc_settings:{service_id}"),
         InlineKeyboardButton(text="🧪 Тест", callback_data=f"svc_test:{service_id}"),
@@ -262,19 +324,30 @@ def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMark
 
 def _run_settings_lines(service_id: str, run_id: int, cfg: dict) -> list:
     """
-    Строки "эмодзи Метка: значение" — что реально применено К ЭТОМУ КОНКРЕТНОМУ
-    потоку. Читаем не текущие настройки сервиса, а именно ЗАФИКСИРОВАННУЮ
-    командную строку этого запуска (mgr.get_cmd) — потому что настройки могли
-    поменять уже ПОСЛЕ его старта, у разных потоков одного сервиса они вполне
-    могут отличаться, и показывать нужно то, что реально используется этим
-    потоком, а не то, что стоит в настройках прямо сейчас.
-
-    Секретные значения (куки) в чат не выводим — только само имя файла,
-    которого достаточно, чтобы понять, использует ли этот поток кастомную
-    сессию и делят ли несколько потоков одну и ту же (одинаковое имя файла).
-    Прокси не секретен в этом смысле (это просто IP/VPN пользователя) —
-    показываем как есть.
+    Что реально применено К ЭТОМУ КОНКРЕТНОМУ потоку. Читаем не текущие
+    настройки, а зафиксированные при старте (mgr.get_cmd/get_pair_id) —
+    настройки могли поменять уже ПОСЛЕ старта, у разных потоков одного
+    сервиса они вполне могут отличаться.
     """
+    if cfg.get("use_proxy_pool"):
+        pair_id = mgr.get_pair_id(service_id, run_id)
+        if pair_id is None:
+            return [
+                "🌐 <b>Прокси</b>: по умолчанию (прямое соединение)",
+                "🍪 <b>Куки</b>: по умолчанию",
+            ]
+        pair = proxy_pairs.get_pair(service_id, pair_id)
+        if not pair:
+            return [
+                "🌐 <b>Прокси</b>: пара удалена из настроек",
+                "🍪 <b>Куки</b>: пара удалена из настроек",
+            ]
+        geo_suffix = f" ({html.escape(pair['geo'])})" if pair.get("geo") else ""
+        return [
+            f"🌐 <b>Прокси</b>: {html.escape(pair['proxy'])}{geo_suffix}",
+            f"🍪 <b>Куки</b>: пара #{pair_id}",
+        ]
+
     fields = cfg.get("settings", [])
     if not fields:
         return []
@@ -292,7 +365,7 @@ def _run_settings_lines(service_id: str, run_id: int, cfg: dict) -> list:
             value_str = f"свои ({html.escape(os.path.basename(raw))})"
         else:
             value_str = html.escape(raw)
-        lines.append(f"{field['label']}: {value_str}")
+        lines.append(f"<b>{field['label']}</b>: {value_str}")
     return lines
 
 
@@ -314,7 +387,9 @@ def _card_text(service_id: str, cfg: dict) -> str:
             elapsed = _fmt_duration((status or {}).get("elapsed_seconds"))
             remaining = _fmt_duration((status or {}).get("remaining_seconds"))
             if params.get("test"):
-                time_str = "тест"
+                time_str = "тест 🔬" if params.get("diagnostic") else "тест"
+            elif params.get("start_at") and (status or {}).get("remaining_seconds") is None:
+                time_str = _fmt_start_at_short(params["start_at"])
             elif elapsed and remaining:
                 time_str = f"{elapsed} прошло / {remaining} осталось"
             else:
@@ -323,9 +398,14 @@ def _card_text(service_id: str, cfg: dict) -> str:
             head = f"{dot} <b>{i}. {html.escape(str(title))}</b>. ({time_str}). {percent_str}"
             block_lines = [head] + _run_settings_lines(service_id, rid, cfg) + [f"<code>{html.escape(url)}</code>"]
             blocks.append("\n".join(block_lines))
-        body = "\n\n".join(blocks)
+        # Разделитель между потоками — сейчас у каждого блока по 4 строки
+        # (заголовок, прокси, куки, ссылка); без пустых строк вокруг черты,
+        # только сама линия отделяет один блок от другого.
+        divider = "─" * 20
+        body = f"\n{divider}\n".join(blocks)
     else:
         body = "Сейчас не запущен."
+
     return f"{cfg['title']}\n\n{body}\n\n{_footer_description(cfg)}"
 
 
@@ -546,7 +626,7 @@ def _settings_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=field["label"], callback_data=f"svc_setting_field:{service_id}:{field['key']}")]
         for field in cfg.get("settings", [])
     ]
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"svc_open:{service_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data=f"svc_settings:{service_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -554,7 +634,7 @@ def _settings_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
 async def cb_svc_settings(call: CallbackQuery):
     service_id = call.data.split(":", 1)[1]
     cfg = get_service(service_id)
-    if not cfg or not cfg.get("settings"):
+    if not cfg or not (cfg.get("settings") or cfg.get("use_proxy_pool")):
         await call.answer("🚧 У этого сервиса пока нет настроек", show_alert=True)
         return
     await call.answer()
@@ -563,7 +643,119 @@ async def cb_svc_settings(call: CallbackQuery):
     # не перезатёрло этот экран, пока пользователь смотрит на настройки.
     _set_view(call.message.chat.id, call.message.message_id, "card", service_id)
     await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      _settings_hub_text(cfg), _settings_hub_keyboard(service_id, cfg), as_caption)
+
+
+def _settings_hub_text(cfg: dict) -> str:
+    return f"{cfg['title']} — настройки\n\nВыбери раздел:"
+
+
+def _settings_hub_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
+    rows = []
+    if cfg.get("use_proxy_pool"):
+        rows.append([InlineKeyboardButton(text="🔗 Прокси/Куки", callback_data=f"svc_settings_pool:{service_id}")])
+    if cfg.get("settings"):
+        rows.append([InlineKeyboardButton(text="🔧 Параметры", callback_data=f"svc_settings_generic:{service_id}")])
+    rows.append([InlineKeyboardButton(text="🧪 Режим тестирования", callback_data=f"svc_settings_testmode:{service_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"svc_open:{service_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("svc_settings_generic:"))
+async def cb_svc_settings_generic(call: CallbackQuery):
+    service_id = call.data.split(":", 1)[1]
+    cfg = get_service(service_id)
+    if not cfg:
+        await call.answer("Сервис не найден", show_alert=True)
+        return
+    await call.answer()
+    as_caption = bool(call.message.document)
+    _set_view(call.message.chat.id, call.message.message_id, "card", service_id)
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
                       _settings_text(cfg, service_id), _settings_keyboard(service_id, cfg), as_caption)
+
+
+@router.callback_query(F.data.startswith("svc_settings_pool:"))
+async def cb_svc_settings_pool(call: CallbackQuery):
+    service_id = call.data.split(":", 1)[1]
+    cfg = get_service(service_id)
+    if not cfg:
+        await call.answer("Сервис не найден", show_alert=True)
+        return
+    await call.answer()
+    as_caption = bool(call.message.document)
+    _set_view(call.message.chat.id, call.message.message_id, "card", service_id)
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      _pool_text(service_id, cfg), _pool_keyboard(service_id, cfg), as_caption)
+
+
+# ──────────────────────────────────────────────────────────
+# Режим тестирования (Настройки → Режим тестирования) — переключатель
+# "Стандартный" (обычный 2-минутный --test, как было всегда) / "Дополнительный"
+# (та же длительность + флаг --diagnostic, включающий в парсере изолированный
+# "лабораторный" код под текущую гипотезу — см. collector._run_diagnostics).
+# Смысл сделать так: проверять гипотезы о работе сайта/ниши/парсинга через
+# уже существующую кнопку "Тест", не трогая основной сбор и не заводя для
+# каждой новой идеи отдельный UI — просто переписываем _run_diagnostics.
+# ──────────────────────────────────────────────────────────
+
+def _test_mode_text(service_id: str, cfg: dict) -> str:
+    mode = mgr.get_test_mode(service_id)
+    mode_label = "Стандартный" if mode == "standard" else "Дополнительный"
+    return (
+        f"{cfg['title']} — режим тестирования\n\n"
+        f"Сейчас выбран: <b>{mode_label}</b>\n\n"
+        "🧪 <b>Стандартный</b> — обычный тестовый сбор на ~2 минуты, как обычно.\n\n"
+        "🔬 <b>Дополнительный</b> — та же длительность, но дополнительно запускает "
+        "изолированный «лабораторный» код под текущую проверяемую гипотезу — "
+        "ошибка в нём не может сорвать ни этот тест, ни тем более настоящий сбор."
+    )
+
+
+def _test_mode_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
+    mode = mgr.get_test_mode(service_id)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("✅ " if mode == "standard" else "⚪ ") + "Стандартный",
+            callback_data=f"svc_set_testmode:{service_id}:standard",
+        )],
+        [InlineKeyboardButton(
+            text=("✅ " if mode == "additional" else "⚪ ") + "Дополнительный",
+            callback_data=f"svc_set_testmode:{service_id}:additional",
+        )],
+        [
+            InlineKeyboardButton(text="⬅️ В настройки", callback_data=f"svc_settings:{service_id}"),
+            InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main"),
+        ],
+    ])
+
+
+@router.callback_query(F.data.startswith("svc_settings_testmode:"))
+async def cb_svc_settings_testmode(call: CallbackQuery):
+    service_id = call.data.split(":", 1)[1]
+    cfg = get_service(service_id)
+    if not cfg:
+        await call.answer("Сервис не найден", show_alert=True)
+        return
+    await call.answer()
+    as_caption = bool(call.message.document)
+    _set_view(call.message.chat.id, call.message.message_id, "card", service_id)
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      _test_mode_text(service_id, cfg), _test_mode_keyboard(service_id, cfg), as_caption)
+
+
+@router.callback_query(F.data.startswith("svc_set_testmode:"))
+async def cb_svc_set_testmode(call: CallbackQuery):
+    _, service_id, mode = call.data.split(":", 2)
+    cfg = get_service(service_id)
+    if not cfg or mode not in ("standard", "additional"):
+        await call.answer("Некорректный режим", show_alert=True)
+        return
+    mgr.set_test_mode(service_id, mode)
+    await call.answer(f"Режим: {'Стандартный' if mode == 'standard' else 'Дополнительный'}")
+    as_caption = bool(call.message.document)
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      _test_mode_text(service_id, cfg), _test_mode_keyboard(service_id, cfg), as_caption)
 
 
 @router.callback_query(F.data.startswith("svc_setting_field:"))
@@ -625,6 +817,239 @@ async def step_setting_value(message: Message, state: FSMContext):
                       _settings_text(cfg, service_id), _settings_keyboard(service_id, cfg), as_caption)
 
 
+# ──────────────────────────────────────────────────────────
+# Пул прокси+куки (use_proxy_pool в service_registry.py) — отдельный от
+# генерик-настроек выше механизм: прокси и куки тут не независимые поля,
+# а СВЯЗАННЫЕ пары (см. services/proxy_pairs.py и обсуждение — куки нужны
+# для DataDome-отпечатка, а не логина, поэтому одну и ту же сессию нельзя
+# гонять с разных гео независимо от прокси, только вместе, как единое целое).
+# ──────────────────────────────────────────────────────────
+
+def _pool_text(service_id: str, cfg: dict) -> str:
+    pairs = proxy_pairs.get_pairs(service_id)
+    lines = [f"{cfg['title']} — прокси/куки", ""]
+    if not pairs:
+        lines.append("Пока не добавлено ни одной пары — новые потоки идут напрямую, без прокси.")
+    else:
+        for p in pairs:
+            used = mgr.pair_active_count(service_id, p["id"])
+            geo = p.get("geo") or "гео не определено"
+            v = p.get("verified")
+            v_emoji = "✅" if v is True else ("❌" if v is False else "🔸")
+            lines.append(f"{v_emoji} <b>Пара #{p['id']}</b> — {html.escape(geo)} · занято {used}/{mgr.MAX_THREADS_PER_PAIR}")
+        lines.append("")
+        lines.append(f"Новый поток берёт наименее занятую пару (до {mgr.MAX_THREADS_PER_PAIR} потоков на каждую). "
+                      "Если все заняты — запуск нового потока будет отклонён, а не пойдёт в обход лимита.")
+    return "\n".join(lines)
+
+
+def _pool_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for p in proxy_pairs.get_pairs(service_id):
+        pid = p["id"]
+        rows.append([
+            InlineKeyboardButton(text=f"🔍 Проверить #{pid}", callback_data=f"pair_check:{service_id}:{pid}"),
+            InlineKeyboardButton(text=f"🗑 Удалить #{pid}", callback_data=f"pair_delete:{service_id}:{pid}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Добавить пару", callback_data=f"pair_add:{service_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data=f"svc_settings:{service_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _lookup_proxy_geo(proxy: str) -> str | None:
+    """
+    Через сам прокси спрашиваем публичный geo-IP сервис, где физически
+    выходит его трафик — best-effort: если не получилось (прокси мёртв,
+    сервис недоступен) — просто не показываем гео, это не мешает
+    использованию самой пары, только косметика в списке.
+    """
+    try:
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "http://ip-api.com/json/?fields=status,country,city,query",
+                proxy=proxy,
+            ) as resp:
+                data = await resp.json(content_type=None)
+        if data.get("status") == "success" and data.get("country"):
+            city = data.get("city")
+            return f"{data['country']}, {city}" if city else data["country"]
+    except Exception as e:
+        logger.warning("Не удалось определить гео прокси %s: %s", proxy, e)
+    return None
+
+
+async def _verify_pair(cfg: dict, pair: dict) -> bool:
+    """
+    Реальная проверка: дёргаем 'python3 main.py debug --proxy ... --cookies-file ...'
+    (публичный GraphQL-запрос без авторизации — куки тут нужны только чтобы
+    не словить блокировку DataDome, см. обсуждение) и смотрим, ответил ли
+    Playerok нормальным JSON'ом или отказом/403.
+    """
+    cmd = [cfg["python"], "-u", cfg["entry"], "debug", "--proxy", pair["proxy"], "--cookies-file", pair["cookies_file"]]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cfg.get("cwd"),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
+        text = stdout.decode("utf-8", errors="replace")
+        return "ОК:" in text and "Запрос не удался" not in text
+    except Exception as e:
+        logger.warning("Ошибка проверки пары прокси+куки: %s", e)
+        return False
+
+
+@router.callback_query(F.data.startswith("pair_add:"))
+async def cb_pair_add(call: CallbackQuery, state: FSMContext):
+    service_id = call.data.split(":", 1)[1]
+    cfg = get_service(service_id)
+    if not cfg:
+        await call.answer("Сервис не найден", show_alert=True)
+        return
+    await call.answer()
+    as_caption = bool(call.message.document)
+    await state.set_state(PairInput.waiting_proxy)
+    await state.update_data(
+        service_id=service_id, as_caption=as_caption,
+        card_chat_id=call.message.chat.id, card_msg_id=call.message.message_id,
+    )
+    _set_view(call.message.chat.id, call.message.message_id, "input", service_id)
+    prompt = (
+        "Пришли адрес прокси для новой пары, например:\n"
+        "<code>http://user:pass@host:port</code> или <code>socks5://host:port</code>"
+    )
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      prompt, _cancel_keyboard(service_id), as_caption)
+
+
+@router.message(PairInput.waiting_proxy, lambda m: not _is_command(m))
+async def step_pair_proxy(message: Message, state: FSMContext):
+    proxy = (message.text or "").strip()
+    data = await state.get_data()
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+    if not proxy:
+        await _edit_card(
+            message.bot, data["card_chat_id"], data["card_msg_id"],
+            "❌ Некорректные данные!\n\nПришли адрес прокси, например:\n"
+            "<code>http://user:pass@host:port</code> или <code>socks5://host:port</code>",
+            _cancel_keyboard(data["service_id"]), data.get("as_caption", False),
+        )
+        return
+
+    await state.update_data(proxy=proxy)
+    await state.set_state(PairInput.waiting_cookies)
+    prompt = (
+        "Теперь пришли содержимое cookie-файла для ЭТОЙ ЖЕ пары — тот же формат, "
+        "что в <code>session_cookies.txt</code> (открой playerok.com в браузере под "
+        "нужным аккаунтом/сессией, DevTools → Network → любой запрос к graphql → "
+        "заголовок Cookie → скопируй значение целиком)."
+    )
+    await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"],
+                      prompt, _cancel_keyboard(data["service_id"]), data.get("as_caption", False))
+
+
+@router.message(PairInput.waiting_cookies, lambda m: not _is_command(m))
+async def step_pair_cookies(message: Message, state: FSMContext):
+    data = await state.get_data()
+    service_id = data["service_id"]
+    proxy = data["proxy"]
+    as_caption = data.get("as_caption", False)
+    cookies_text = (message.text or "").strip()
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+    if not cookies_text:
+        await _edit_card(
+            message.bot, data["card_chat_id"], data["card_msg_id"],
+            "❌ Некорректные данные!\n\nПришли содержимое cookie-файла ещё раз.",
+            _cancel_keyboard(service_id), as_caption,
+        )
+        return
+
+    await state.clear()
+    cfg = get_service(service_id)
+
+    pair = proxy_pairs.add_pair(service_id, proxy, cookies_file="")
+    cookies_path = mgr.STATUS_DIR / f"{service_id}_pair_{pair['id']}_cookies.txt"
+    cookies_path.write_text(cookies_text, encoding="utf-8")
+    proxy_pairs.update_pair(service_id, pair["id"], cookies_file=str(cookies_path))
+
+    _set_view(data["card_chat_id"], data["card_msg_id"], "card", service_id)
+    await _edit_card(
+        message.bot, data["card_chat_id"], data["card_msg_id"],
+        f"⏳ Пара #{pair['id']} добавлена, определяю геолокацию прокси...",
+        InlineKeyboardMarkup(inline_keyboard=[]), as_caption,
+    )
+
+    geo = await _lookup_proxy_geo(proxy)
+    proxy_pairs.update_pair(service_id, pair["id"], geo=geo)
+
+    await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"],
+                      _pool_text(service_id, cfg), _pool_keyboard(service_id, cfg), as_caption)
+
+
+@router.callback_query(F.data.startswith("pair_check:"))
+async def cb_pair_check(call: CallbackQuery):
+    _, service_id, pair_id_str = call.data.split(":", 2)
+    pair_id = int(pair_id_str)
+    cfg = get_service(service_id)
+    pair = proxy_pairs.get_pair(service_id, pair_id)
+    if not cfg or not pair:
+        await call.answer("Пара не найдена", show_alert=True)
+        return
+    await call.answer("Проверяю… (до ~25 сек)")
+    as_caption = bool(call.message.document)
+
+    async def _check_and_refresh():
+        ok = await _verify_pair(cfg, pair)
+        proxy_pairs.update_pair(service_id, pair_id, verified=ok)
+        await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                          _pool_text(service_id, cfg), _pool_keyboard(service_id, cfg), as_caption)
+
+    _fire_and_forget(_check_and_refresh())
+
+
+@router.callback_query(F.data.startswith("pair_delete:"))
+async def cb_pair_delete(call: CallbackQuery):
+    _, service_id, pair_id_str = call.data.split(":", 2)
+    pair_id = int(pair_id_str)
+    cfg = get_service(service_id)
+    if not cfg:
+        await call.answer("Сервис не найден", show_alert=True)
+        return
+
+    used = mgr.pair_active_count(service_id, pair_id)
+    if used > 0:
+        await call.answer(f"Нельзя удалить — на ней {used} активных потоков", show_alert=True)
+        return
+
+    pair = proxy_pairs.get_pair(service_id, pair_id)
+    proxy_pairs.remove_pair(service_id, pair_id)
+    if pair and pair.get("cookies_file"):
+        try:
+            Path(pair["cookies_file"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    await call.answer("Пара удалена")
+    as_caption = bool(call.message.document)
+    await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
+                      _pool_text(service_id, cfg), _pool_keyboard(service_id, cfg), as_caption)
+
+
 @router.callback_query(F.data.startswith("svc_cancel_input:"))
 async def cb_svc_cancel_input(call: CallbackQuery, state: FSMContext):
     """
@@ -655,7 +1080,19 @@ def _is_command(message: Message) -> bool:
     return bool(message.text and message.text.startswith("/"))
 
 
-async def _begin_input_flow(call: CallbackQuery, state: FSMContext, service_id: str, test_mode: bool):
+def _test_launch_params(service_id: str, url: str = None) -> dict:
+    """{"test": True} плюс "diagnostic": True, если в Настройках выбран
+    режим тестирования "Дополнительный" (см. mgr.get_test_mode)."""
+    params = {"test": True}
+    if url is not None:
+        params["url"] = url
+    if mgr.get_test_mode(service_id) == "additional":
+        params["diagnostic"] = True
+    return params
+
+
+async def _begin_input_flow(call: CallbackQuery, state: FSMContext, service_id: str, test_mode: bool,
+                             delayed: bool = False):
     await state.clear()
     cfg = get_service(service_id)
     if not cfg:
@@ -667,7 +1104,7 @@ async def _begin_input_flow(call: CallbackQuery, state: FSMContext, service_id: 
     as_caption = bool(call.message.document)
 
     if input_kind == "none":
-        params = {"test": True} if test_mode else {}
+        params = _test_launch_params(service_id) if test_mode else {}
         await _launch(call.message.bot, call.message.chat.id, call.message.message_id, service_id, params, as_caption)
         return
 
@@ -677,7 +1114,7 @@ async def _begin_input_flow(call: CallbackQuery, state: FSMContext, service_id: 
 
     await state.set_state(ServiceInput.waiting_url)
     await state.update_data(
-        service_id=service_id, test_mode=test_mode, as_caption=as_caption,
+        service_id=service_id, test_mode=test_mode, delayed=delayed, as_caption=as_caption,
         card_chat_id=call.message.chat.id, card_msg_id=call.message.message_id,
     )
 
@@ -694,6 +1131,12 @@ async def _begin_input_flow(call: CallbackQuery, state: FSMContext, service_id: 
 async def cb_svc_start(call: CallbackQuery, state: FSMContext):
     service_id = call.data.split(":", 1)[1]
     await _begin_input_flow(call, state, service_id, test_mode=False)
+
+
+@router.callback_query(F.data.startswith("svc_start_delayed:"))
+async def cb_svc_start_delayed(call: CallbackQuery, state: FSMContext):
+    service_id = call.data.split(":", 1)[1]
+    await _begin_input_flow(call, state, service_id, test_mode=False, delayed=True)
 
 
 @router.callback_query(F.data.startswith("svc_test:"))
@@ -727,7 +1170,7 @@ async def step_waiting_url(message: Message, state: FSMContext):
     if test_mode:
         await state.clear()
         await _launch(message.bot, data["card_chat_id"], data["card_msg_id"], service_id,
-                      {"url": url, "test": True}, as_caption)
+                      _test_launch_params(service_id, url=url), as_caption)
         return
 
     await state.update_data(url=url)
@@ -764,8 +1207,54 @@ async def step_waiting_hours(message: Message, state: FSMContext):
         return
 
     params = {"url": data["url"], "hours": hours}
-    await state.clear()
 
+    if data.get("delayed"):
+        await state.update_data(pending_params=params)
+        await state.set_state(ServiceInput.waiting_start_time)
+        prompt = (
+            "⏰ Во сколько запустить? Пришли время в формате <code>ЧЧ:ММ</code> "
+            "(по Екатеринбургу, UTC+5) — например <code>00:00</code>.\n\n"
+            "Если это время сегодня уже прошло — запущу в это же время завтра."
+        )
+        await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"],
+                          prompt, _cancel_keyboard(service_id), as_caption)
+        return
+
+    await state.clear()
+    await _launch(message.bot, data["card_chat_id"], data["card_msg_id"], service_id, params, as_caption)
+
+
+@router.message(ServiceInput.waiting_start_time, lambda m: not _is_command(m))
+async def step_waiting_start_time(message: Message, state: FSMContext):
+    data = await state.get_data()
+    service_id = data["service_id"]
+    as_caption = data.get("as_caption", False)
+    cfg = get_service(service_id)
+    raw = (message.text or "").strip()
+
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+    target_dt_utc = _parse_start_time_to_utc(raw)
+    if target_dt_utc is None:
+        await _edit_card(
+            message.bot, data["card_chat_id"], data["card_msg_id"],
+            "❌ Некорректные данные!\n\nПришли время в формате <code>ЧЧ:ММ</code>, например <code>00:00</code> "
+            "или <code>18:30</code>.",
+            _cancel_keyboard(service_id), as_caption,
+        )
+        return
+
+    params = data["pending_params"]
+    params["start_at"] = target_dt_utc.isoformat()
+    await state.clear()
+    # Никакого отдельного планировщика — это самый обычный _launch(), просто
+    # у процесса будет флаг --start-at (см. main.py): он запустится прямо
+    # сейчас (займёт слот/пару прокси как обычный поток), но сам сбор
+    # отложит до нужного момента сам, внутри себя. Упади Shinoa хоть на всё
+    # время ожидания — процессу всё равно, ему Shinoa для этого не нужна.
     await _launch(message.bot, data["card_chat_id"], data["card_msg_id"], service_id, params, as_caption)
 
 
