@@ -301,11 +301,15 @@ def _card_keyboard(service_id: str, minimal: bool = False) -> InlineKeyboardMark
     if run_ids:
         for rid in run_ids:
             rows.append([InlineKeyboardButton(text=_thread_label(service_id, rid), callback_data=f"svc_thread:{service_id}:{rid}")])
-        rows.append([InlineKeyboardButton(text="➕ Добавить поток", callback_data=f"svc_start:{service_id}")])
+        rows.append([
+            InlineKeyboardButton(text="➕ Добавить поток", callback_data=f"svc_start:{service_id}"),
+            InlineKeyboardButton(text="⏰ Отложенный старт", callback_data=f"svc_start_delayed:{service_id}"),
+        ])
     else:
-        rows.append([InlineKeyboardButton(text="▶️ Запустить", callback_data=f"svc_start:{service_id}")])
-
-    rows.append([InlineKeyboardButton(text="⏰ Отложенный старт", callback_data=f"svc_start_delayed:{service_id}")])
+        rows.append([
+            InlineKeyboardButton(text="▶️ Запустить", callback_data=f"svc_start:{service_id}"),
+            InlineKeyboardButton(text="⏰ Отложенный старт", callback_data=f"svc_start_delayed:{service_id}"),
+        ])
 
     rows.append([
         InlineKeyboardButton(text="⚙️ Настройки", callback_data=f"svc_settings:{service_id}"),
@@ -651,13 +655,18 @@ def _settings_hub_text(cfg: dict) -> str:
 
 
 def _settings_hub_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
-    rows = []
+    buttons = []
     if cfg.get("use_proxy_pool"):
-        rows.append([InlineKeyboardButton(text="🔗 Прокси/Куки", callback_data=f"svc_settings_pool:{service_id}")])
+        buttons.append(InlineKeyboardButton(text="🔗 Прокси/Куки", callback_data=f"svc_settings_pool:{service_id}"))
     if cfg.get("settings"):
-        rows.append([InlineKeyboardButton(text="🔧 Параметры", callback_data=f"svc_settings_generic:{service_id}")])
-    rows.append([InlineKeyboardButton(text="🧪 Режим тестирования", callback_data=f"svc_settings_testmode:{service_id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"svc_open:{service_id}")])
+        buttons.append(InlineKeyboardButton(text="🔧 Параметры", callback_data=f"svc_settings_generic:{service_id}"))
+    buttons.append(InlineKeyboardButton(text="🧪 Режим тестирования", callback_data=f"svc_settings_testmode:{service_id}"))
+
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"svc_open:{service_id}"),
+        InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

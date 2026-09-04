@@ -28,6 +28,7 @@ from config import BOT_TOKEN, DEFAULT_TIMEZONE, ALLOWED_USERS
 from handlers import main_router, set_scheduler
 from scheduler import ReminderScheduler
 from middlewares.access import AccessMiddleware
+from services.bot_session import ProxySwitchableSession
 
 # ──────────────────────────────────────────────
 # Логирование: консоль + файл (ротация 5 МБ, 3 архива)
@@ -151,8 +152,35 @@ async def send_goodbye_message(bot: Bot):
 
 
 async def main():
-    bot = Bot(token=BOT_TOKEN)
+    # ──────────────────────────────────────────
+    # Создание бота с сессией, поддерживающей переключение прокси
+    # ──────────────────────────────────────────
+    bot = Bot(token=BOT_TOKEN, session=ProxySwitchableSession())
     dp = Dispatcher(storage=MemoryStorage())
+
+    # ──────────────────────────────────────────
+    # Восстановление прокси ДО любых сетевых запросов
+    # ──────────────────────────────────────────
+    try:
+        from database.proxies import ensure_proxies_table, get_active_proxy, set_active
+        from services.proxy_tools import build_proxy_url, check_proxy
+
+        await ensure_proxies_table()
+        active = await get_active_proxy()
+        if active:
+            res = await check_proxy(build_proxy_url(active), timeout=8)
+            if res["ok"]:
+                bot.session.proxy = build_proxy_url(active)
+                logger.info("♻️ Бот поднят через прокси %s:%s", active["host"], active["port"])
+            else:
+                # Прокси мёртв — стартуем напрямую и снимаем флаг, чтобы UI не врал
+                await set_active(active["id"], False)
+                logger.warning(
+                    "⚠️ Сохранённый прокси %s:%s недоступен (%s) — старт через прямое подключение",
+                    active["host"], active["port"], res.get("error"),
+                )
+    except Exception as e:
+        logger.warning("Не удалось восстановить прокси при старте: %s", e)
 
     # ──────────────────────────────────────────
     # Подключение middleware для ограничения доступа
@@ -299,7 +327,7 @@ async def main():
         try:
             await send_goodbye_message(bot)
         except Exception as e:
-            logger.error(f"Ошибка прощальной рассылки: {e}")
+            logger.error(f"Ошибка прощальной рассылки: %s", e)
 
         await scheduler.stop()
         await bot.session.close()
