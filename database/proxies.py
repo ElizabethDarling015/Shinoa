@@ -130,3 +130,13 @@ async def update_check(proxy_id: int, res: dict) -> None:
             ),
         )
         await db.commit()
+
+
+async def get_first_proxy() -> dict | None:
+    """Возвращает первый прокси из БД (по ID)."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT * FROM user_proxies ORDER BY id ASC LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None

@@ -183,6 +183,10 @@ def _has_real_progress(status: dict | None) -> bool:
         return False
     percent = status.get("progress_percent")
     ptext = status.get("progress_text")
+    if ptext and ptext.startswith("ожидание старта"):
+        # Отложенный старт ещё не наступил — это не прогресс, а его отсутствие,
+        # несмотря на непустой progress_text (см. main.py, --start-at).
+        return False
     return (percent not in (None, 0)) or bool(ptext)
 
 
@@ -200,7 +204,14 @@ def _progress_line(status: dict | None) -> str:
     percent = status.get("progress_percent")
     ptext = status.get("progress_text")
     if ptext and ptext.startswith("ожидание старта"):
-        return f"⏳ {html.escape(str(ptext))}"
+        # "ожидание старта в 13:00 04.09 (Екатеринбург)" -> вставляем ⏳ перед
+        # скобкой с городом вместо пробела, дот жёлтый (это не прогресс).
+        if " (" in ptext:
+            before, paren = ptext.rsplit(" (", 1)
+            formatted = f"{before}⏳({paren}"
+        else:
+            formatted = f"{ptext}⏳"
+        return f"🟡 {html.escape(formatted)}"
     line = f"{dot} Собирается"
     if percent is not None:
         line += f": {percent}%"
@@ -410,7 +421,7 @@ def _card_text(service_id: str, cfg: dict) -> str:
     else:
         body = "Сейчас не запущен."
 
-    return f"{cfg['title']}\n\n{body}\n\n{_footer_description(cfg)}"
+    return f"<b>{html.escape(cfg['title'])}</b>\n\n{body}\n\n{_footer_description(cfg)}"
 
 
 async def _show_card(message: Message, service_id: str, as_caption: bool = False, minimal: bool = False):
@@ -461,11 +472,11 @@ def _thread_text(service_id: str, cfg: dict, run_id: int) -> str:
 
     title = (status or {}).get("niche_title") or url
     lines = [
-        f"{cfg['title']} — {html.escape(str(title))}",
+        f"<b>{html.escape(cfg['title'])} — {html.escape(str(title))}</b>",
         "",
-        f"Ниша: <code>{html.escape(url)}</code>",
-        f"Дата запуска: {html.escape(started_at)} UTC",
-        f"Прогресс: {_progress_line(status)}",
+        f"<b>Ниша</b>: <code>{html.escape(url)}</code>",
+        f"<b>Дата запуска</b>: {html.escape(started_at)} UTC",
+        f"<b>Прогресс</b>: {_progress_line(status)}",
     ]
     if params.get("test"):
         lines.append("Режим: тест (~2 мин)")
@@ -473,7 +484,7 @@ def _thread_text(service_id: str, cfg: dict, run_id: int) -> str:
         remaining = _fmt_duration((status or {}).get("remaining_seconds"))
         total = _fmt_duration((status or {}).get("total_seconds"))
         if remaining and total:
-            lines.append(f"Осталось: {remaining} из {total}")
+            lines.append(f"<b>Осталось</b>: {remaining} из {total}")
 
     return "\n".join(lines) + paused_note
 

@@ -10,6 +10,7 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+import argparse
 
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -29,6 +30,31 @@ from handlers import main_router, set_scheduler
 from scheduler import ReminderScheduler
 from middlewares.access import AccessMiddleware
 from services.bot_session import ProxySwitchableSession
+
+
+def parse_args():
+    """Парсит аргументы командной строки."""
+    parser = argparse.ArgumentParser(
+        description="Telegram Personal Organizer Bot",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры запуска:
+  python3 bot.py              # без прокси (прямое подключение)
+  python3 bot.py --proxy1     # использовать первый прокси из БД
+        """
+    )
+    
+    parser.add_argument(
+        '--proxy1',
+        action='store_true',
+        help='Использовать первый прокси из БД для подключения к Telegram API'
+    )
+    
+    return parser.parse_args()
+
+# Парсим аргументы при импорте модуля
+args = parse_args()
+
 
 # ──────────────────────────────────────────────
 # Логирование: консоль + файл (ротация 5 МБ, 3 архива)
@@ -162,23 +188,36 @@ async def main():
     # Восстановление прокси ДО любых сетевых запросов
     # ──────────────────────────────────────────
     try:
-        from database.proxies import ensure_proxies_table, get_active_proxy, set_active
+        from database.proxies import ensure_proxies_table, get_first_proxy
         from services.proxy_tools import build_proxy_url, check_proxy
 
         await ensure_proxies_table()
-        active = await get_active_proxy()
-        if active:
-            res = await check_proxy(build_proxy_url(active), timeout=8)
-            if res["ok"]:
-                bot.session.proxy = build_proxy_url(active)
-                logger.info("♻️ Бот поднят через прокси %s:%s", active["host"], active["port"])
+        
+        # Если задан флаг --proxy1 - берём первый прокси из БД
+        if args.proxy1:
+            logger.info("🔍 Флаг --proxy1: ищу первый прокси в БД...")
+            first_proxy = await get_first_proxy()
+            
+            if first_proxy:
+                logger.info("🔍 Проверяю первый прокси %s:%s...", 
+                           first_proxy["host"], first_proxy["port"])
+                res = await check_proxy(build_proxy_url(first_proxy), timeout=8)
+                
+                if res["ok"]:
+                    bot.session.proxy = build_proxy_url(first_proxy)
+                    logger.info("♻️ Бот поднят через первый прокси из БД %s:%s (%d мс)", 
+                               first_proxy["host"], first_proxy["port"], res.get("ms", 0))
+                else:
+                    logger.warning(
+                        "⚠️ Первый прокси %s:%s недоступен (%s) — старт через прямое подключение",
+                        first_proxy["host"], first_proxy["port"], res.get("error")
+                    )
             else:
-                # Прокси мёртв — стартуем напрямую и снимаем флаг, чтобы UI не врал
-                await set_active(active["id"], False)
-                logger.warning(
-                    "⚠️ Сохранённый прокси %s:%s недоступен (%s) — старт через прямое подключение",
-                    active["host"], active["port"], res.get("error"),
-                )
+                logger.warning("⚠️ Флаг --proxy1 задан, но в БД нет ни одного прокси — старт напрямую")
+        else:
+            # Без флага - всегда прямое подключение (игнорируем БД)
+            logger.info("🌐 Прокси не задан — старт через прямое подключение")
+            
     except Exception as e:
         logger.warning("Не удалось восстановить прокси при старте: %s", e)
 
