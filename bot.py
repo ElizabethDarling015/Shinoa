@@ -39,8 +39,13 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры запуска:
-  python3 bot.py              # без прокси (прямое подключение)
-  python3 bot.py --proxy1     # использовать первый прокси из БД
+  python3 bot.py                          # без прокси (прямое подключение)
+  python3 bot.py --proxy1                 # использовать первый прокси из БД
+  python3 bot.py --add-proxy=host:port    # занести прокси в БД и выйти (бот НЕ стартует)
+
+Сценарий "нет VPN, нет прокси, Telegram-меню Настройки -> Прокси без сети не
+поднять": сначала `--add-proxy=...`, чтобы положить прокси в БД напрямую,
+затем обычным `--proxy1` поднимаете бота уже через него.
         """
     )
     
@@ -48,6 +53,17 @@ def parse_args():
         '--proxy1',
         action='store_true',
         help='Использовать первый прокси из БД для подключения к Telegram API'
+    )
+
+    parser.add_argument(
+        '--add-proxy',
+        metavar='URL',
+        default=None,
+        help=(
+            'Принудительно занести прокси в БД, минуя Telegram-меню, и сразу выйти '
+            '(бот не запускается). Форматы: socks5://user:pass@host:port, '
+            'http://host:port, host:port, host:port:user:pass (без схемы = HTTP).'
+        ),
     )
     
     return parser.parse_args()
@@ -74,6 +90,59 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+async def handle_add_proxy_flag(url: str) -> int:
+    """
+    --add-proxy=<url> — самостоятельная команда для сценария "нет VPN, нет
+    прокси, а Telegram-меню Настройки -> Прокси без сети до Telegram не
+    поднять": пишет прокси напрямую в ту же таблицу user_proxies, которую
+    использует и меню, и флаг --proxy1, и завершает процесс — бот НЕ
+    запускается, к Telegram не обращается, никаких сетевых проверок не делает
+    (проверка связи и есть смысл --proxy1 при следующем запуске).
+
+    Возвращает код возврата процесса (0 — успех, 1 — ошибка разбора/конфига).
+    """
+    from database.proxies import ensure_proxies_table, add_or_update_proxy
+    from services.proxy_tools import parse_proxy_text, type_label
+
+    if not ALLOWED_USERS:
+        logger.error(
+            "❌ --add-proxy: в .env пуст ALLOWED_USERS — непонятно, за каким "
+            "пользователем закрепить прокси (эта же запись потом отображается "
+            "и переключается в Telegram-меню Настройки -> Прокси)."
+        )
+        return 1
+
+    # Без явной схемы (host:port или host:port:user:pass) считаем HTTP —
+    # так же, как и остальной код проекта трактует «сырые» host:port.
+    parsed = parse_proxy_text(url, fallback_type="http")
+    if not parsed:
+        logger.error(
+            "❌ --add-proxy: не удалось разобрать %r. Поддерживаемые форматы:\n"
+            "  socks5://user:pass@host:port\n"
+            "  http://host:port\n"
+            "  host:port            (без схемы считается HTTP)\n"
+            "  host:port:user:pass",
+            url,
+        )
+        return 1
+
+    owner_id = ALLOWED_USERS[0]
+    await ensure_proxies_table()
+    proxy = await add_or_update_proxy(
+        owner_id, parsed["type"], parsed["host"], parsed["port"],
+        parsed["username"], parsed["password"],
+    )
+
+    logger.info(
+        "✅ Прокси сохранён в БД: %s %s:%s (id=%s, владелец=%s).\n"
+        "   Проверка связи и подключение бота — следующим запуском:\n"
+        "   python3 bot.py --proxy1",
+        type_label(proxy["proxy_type"]), proxy["host"], proxy["port"],
+        proxy["id"], owner_id,
+    )
+    return 0
 
 # ──────────────────────────────────────────────
 # Роутер для обработки кнопки «До завтра» на прощальном сообщении
@@ -186,40 +255,63 @@ async def main():
 
     # ──────────────────────────────────────────
     # Восстановление прокси ДО любых сетевых запросов
+    #
+    # ВАЖНО: если --proxy1 задан явно, здесь НЕТ тихого отката на прямое
+    # подключение ни при каких ошибках (сломанный импорт, пустая БД, мёртвый
+    # прокси) — раньше именно такой откат маскировал ImportError и бот думал,
+    # что работает через прокси, а на деле шёл напрямую. Раз человек явно
+    # попросил прокси — либо он поднимается, либо бот падает с понятной
+    # причиной, а не стартует в неожиданном для пользователя режиме.
     # ──────────────────────────────────────────
     try:
-        from database.proxies import ensure_proxies_table, get_first_proxy
-        from services.proxy_tools import build_proxy_url, check_proxy
-
+        from database.proxies import ensure_proxies_table
         await ensure_proxies_table()
-        
-        # Если задан флаг --proxy1 - берём первый прокси из БД
-        if args.proxy1:
-            logger.info("🔍 Флаг --proxy1: ищу первый прокси в БД...")
-            first_proxy = await get_first_proxy()
-            
-            if first_proxy:
-                logger.info("🔍 Проверяю первый прокси %s:%s...", 
-                           first_proxy["host"], first_proxy["port"])
-                res = await check_proxy(build_proxy_url(first_proxy), timeout=8)
-                
-                if res["ok"]:
-                    bot.session.proxy = build_proxy_url(first_proxy)
-                    logger.info("♻️ Бот поднят через первый прокси из БД %s:%s (%d мс)", 
-                               first_proxy["host"], first_proxy["port"], res.get("ms", 0))
-                else:
-                    logger.warning(
-                        "⚠️ Первый прокси %s:%s недоступен (%s) — старт через прямое подключение",
-                        first_proxy["host"], first_proxy["port"], res.get("error")
-                    )
-            else:
-                logger.warning("⚠️ Флаг --proxy1 задан, но в БД нет ни одного прокси — старт напрямую")
-        else:
-            # Без флага - всегда прямое подключение (игнорируем БД)
-            logger.info("🌐 Прокси не задан — старт через прямое подключение")
-            
     except Exception as e:
-        logger.warning("Не удалось восстановить прокси при старте: %s", e)
+        logger.warning("Не удалось создать/проверить таблицу прокси: %s", e)
+
+    if args.proxy1:
+        try:
+            from database.proxies import get_first_proxy
+            from services.proxy_tools import build_proxy_url, check_proxy
+        except ImportError as e:
+            logger.critical(
+                "❌ --proxy1: не удалось импортировать %s. Похоже, файл "
+                "database/proxies.py на диске не соответствует ожидаемому "
+                "(нет функции get_first_proxy) — бот НЕ будет молча запущен "
+                "без прокси. Проверьте файл и запустите снова.", e,
+            )
+            sys.exit(1)
+
+        logger.info("🔍 Флаг --proxy1: ищу первый прокси в БД...")
+        first_proxy = await get_first_proxy()
+
+        if not first_proxy:
+            logger.critical(
+                "❌ --proxy1: в БД нет ни одного прокси. Сначала добавьте: "
+                "python3 bot.py --add-proxy=<url>"
+            )
+            sys.exit(1)
+
+        logger.info("🔍 Проверяю первый прокси %s:%s...",
+                   first_proxy["host"], first_proxy["port"])
+        res = await check_proxy(build_proxy_url(first_proxy), timeout=8)
+
+        if not res["ok"]:
+            logger.critical(
+                "❌ --proxy1: прокси %s:%s недоступен (%s). Бот НЕ будет "
+                "запущен напрямую вместо него — исправьте прокси или "
+                "запустите без --proxy1, если временно устраивает прямое "
+                "подключение.", first_proxy["host"], first_proxy["port"],
+                res.get("error"),
+            )
+            sys.exit(1)
+
+        bot.session.proxy = build_proxy_url(first_proxy)
+        logger.info("♻️ Бот поднят через первый прокси из БД %s:%s (%d мс)",
+                   first_proxy["host"], first_proxy["port"], res.get("ms", 0))
+    else:
+        # Без флага - всегда прямое подключение (игнорируем БД)
+        logger.info("🌐 Прокси не задан — старт через прямое подключение")
 
     # ──────────────────────────────────────────
     # Подключение middleware для ограничения доступа
@@ -374,6 +466,10 @@ async def main():
 
 
 if __name__ == "__main__":
+    if args.add_proxy:
+        # Самостоятельная команда: только запись в БД, бот не запускается.
+        sys.exit(asyncio.run(handle_add_proxy_flag(args.add_proxy)))
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
