@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -42,10 +43,16 @@ def parse_args():
   python3 bot.py                          # без прокси (прямое подключение)
   python3 bot.py --proxy1                 # использовать первый прокси из БД
   python3 bot.py --add-proxy=host:port    # занести прокси в БД и выйти (бот НЕ стартует)
+  python3 bot.py --update                 # обновиться из GitHub и перезапуститься
+  python3 bot.py --update --proxy1        # обновиться, затем стартовать уже через прокси
 
 Сценарий "нет VPN, нет прокси, Telegram-меню Настройки -> Прокси без сети не
 поднять": сначала `--add-proxy=...`, чтобы положить прокси в БД напрямую,
 затем обычным `--proxy1` поднимаете бота уже через него.
+
+Флаги можно сочетать: --update применяется первым (код обновляется и
+процесс перезапускает сам себя), остальные флаги (--proxy1, --add-proxy)
+разбираются уже после перезапуска, на свежем коде.
         """
     )
     
@@ -63,6 +70,18 @@ def parse_args():
             'Принудительно занести прокси в БД, минуя Telegram-меню, и сразу выйти '
             '(бот не запускается). Форматы: socks5://user:pass@host:port, '
             'http://host:port, host:port, host:port:user:pass (без схемы = HTTP).'
+        ),
+    )
+
+    parser.add_argument(
+        '--update',
+        action='store_true',
+        help=(
+            'Обновить код из GitHub (git fetch + pull --ff-only в каталоге бота) и '
+            'перезапустить процесс. Останавливается, если есть незакоммиченные '
+            'локальные изменения или история разошлась (не fast-forward) — '
+            'автоматических merge/rebase не делает. Можно сочетать с другими '
+            'флагами: python3 bot.py --update --proxy1.'
         ),
     )
     
@@ -90,6 +109,84 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+def handle_update_flag() -> int:
+    """
+    --update — самостоятельное действие: подтягивает изменения из GitHub
+    (git fetch + git pull --ff-only) в каталоге, где лежит bot.py.
+
+    Намеренно НЕ делает автоматический merge/rebase при расхождении истории —
+    это ровно тот сценарий, который у нас уже был с --proxy1 (тихий откат при
+    ошибке маскирует проблему), поэтому при любой неоднозначности --update
+    останавливается с понятной причиной, а не пытается сам всё разрулить.
+
+    Комбинируется с другими флагами: __main__ вызывает эту функцию первой,
+    а после успеха перезапускает процесс (os.execv) с теми же аргументами
+    минус --update — так --update --proxy1 сначала обновит код, а затем
+    стартует уже обновлённым процессом через прокси.
+
+    Возвращает код возврата (0 — успех/нечего обновлять, 1 — остановлено).
+    """
+    repo_dir = Path(__file__).resolve().parent
+
+    def run(cmd: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True)
+
+    if run(["git", "rev-parse", "--is-inside-work-tree"]).returncode != 0:
+        logger.error("❌ --update: %s — это не git-репозиторий.", repo_dir)
+        return 1
+
+    status = run(["git", "status", "--porcelain"])
+    if status.stdout.strip():
+        logger.error(
+            "❌ --update: есть незакоммиченные изменения — обновление "
+            "остановлено, чтобы их не затереть. Закоммитьте или спрячьте "
+            "(git stash), затем повторите:\n%s",
+            status.stdout.strip(),
+        )
+        return 1
+
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() or "main"
+    old_head = run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+    req_path = repo_dir / "requirements.txt"
+    old_req = req_path.read_text() if req_path.exists() else ""
+
+    logger.info("🔄 --update: получаю изменения из origin/%s...", branch)
+    fetch = run(["git", "fetch", "origin", branch])
+    if fetch.returncode != 0:
+        logger.error("❌ --update: git fetch не удался:\n%s", fetch.stderr.strip())
+        return 1
+
+    pull = run(["git", "pull", "--ff-only", "origin", branch])
+    if pull.returncode != 0:
+        logger.error(
+            "❌ --update: fast-forward не получился — история разошлась "
+            "(есть незапушенные локальные коммиты). Автоматически сливать "
+            "не буду, разберитесь вручную (git pull --rebase и т.п.) и "
+            "запустите ещё раз:\n%s",
+            (pull.stderr or pull.stdout).strip(),
+        )
+        return 1
+
+    new_head = run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+
+    if old_head == new_head:
+        logger.info("✅ --update: уже последняя версия (%s) — обновлять нечего.", new_head)
+        return 0
+
+    log = run(["git", "log", "--oneline", f"{old_head}..{new_head}"])
+    logger.info("✅ --update: %s → %s:\n%s", old_head, new_head, log.stdout.strip())
+
+    new_req = req_path.read_text() if req_path.exists() else ""
+    if new_req != old_req:
+        logger.warning(
+            "⚠️ requirements.txt изменился — после перезапуска выполните "
+            "'pip install -r requirements.txt', иначе новый код может "
+            "падать с ImportError."
+        )
+
+    return 0
 
 
 async def handle_add_proxy_flag(url: str) -> int:
@@ -466,6 +563,26 @@ async def main():
 
 
 if __name__ == "__main__":
+    if args.update:
+        # --update идёт первым при любой комбинации флагов: код должен
+        # обновиться ДО того, как что-либо ещё (--proxy1, --add-proxy)
+        # начнёт работать со свежими файлами.
+        rc = handle_update_flag()
+        if rc != 0:
+            sys.exit(rc)
+
+        # Перечитать файлы с диска в уже запущенном интерпретаторе нельзя
+        # надёжно (модули импортируются один раз) — поэтому перезапускаем
+        # процесс целиком тем же интерпретатором, передавая дальше все
+        # остальные флаги, кроме --update (иначе зациклимся).
+        remaining_argv = [a for a in sys.argv[1:] if a != "--update"]
+        logger.info(
+            "🔁 Перезапуск на обновлённом коде%s...",
+            f" (флаги: {' '.join(remaining_argv)})" if remaining_argv else "",
+        )
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + remaining_argv)
+        # os.execv не возвращается при успехе — код ниже уже не выполнится
+
     if args.add_proxy:
         # Самостоятельная команда: только запись в БД, бот не запускается.
         sys.exit(asyncio.run(handle_add_proxy_flag(args.add_proxy)))
