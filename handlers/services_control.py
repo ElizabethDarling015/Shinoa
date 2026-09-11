@@ -33,6 +33,7 @@ from aiogram.exceptions import TelegramBadRequest
 from services.service_registry import get_service, list_services
 from services import service_manager as mgr
 from services import proxy_pairs
+from services.proxy_tools import check_proxy
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -880,34 +881,38 @@ def _pool_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
 
 async def _lookup_proxy_geo(proxy: str) -> str | None:
     """
-    Через сам прокси спрашиваем публичный geo-IP сервис, где физически
-    выходит его трафик — best-effort: если не получилось (прокси мёртв,
-    сервис недоступен) — просто не показываем гео, это не мешает
-    использованию самой пары, только косметика в списке.
+    Определяем гео через сам прокси — переиспользуем ту же проверку, что и
+    для прокси самого бота (services/proxy_tools.check_proxy): она умеет и
+    HTTP(S), и SOCKS4/5 через aiohttp_socks. РАНЬШЕ здесь был отдельный
+    самописный запрос голым aiohttp — а голый aiohttp SOCKS5 не поддерживает
+    вообще (нужен именно aiohttp_socks.ProxyConnector), поэтому для любой
+    SOCKS5-пары гео молча не определялось, выглядя как "прокси не ответил",
+    хотя дело было в самой проверке, а не в прокси.
+
+    best-effort: если не получилось (прокси реально мёртв, гео-сервис
+    недоступен) — просто не показываем гео, это не мешает использованию
+    самой пары для сбора, только косметика в списке.
     """
-    try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                "http://ip-api.com/json/?fields=status,country,city,query",
-                proxy=proxy,
-            ) as resp:
-                data = await resp.json(content_type=None)
-        if data.get("status") == "success" and data.get("country"):
-            city = data.get("city")
-            return f"{data['country']}, {city}" if city else data["country"]
-    except Exception as e:
-        logger.warning("Не удалось определить гео прокси %s: %s", proxy, e)
+    res = await check_proxy(proxy)
+    if not res["ok"]:
+        logger.warning("Не удалось определить гео/связность прокси %s: %s", proxy, res.get("error"))
+        return None
+    if res.get("country_name"):
+        return f"{res['country_name']}, {res['city']}" if res.get("city") else res["country_name"]
     return None
 
 
-async def _verify_pair(cfg: dict, pair: dict) -> bool:
+async def _verify_pair(cfg: dict, pair: dict) -> tuple[bool, str]:
     """
     Реальная проверка: дёргаем 'python3 main.py debug --proxy ... --cookies-file ...'
     (публичный GraphQL-запрос без авторизации — куки тут нужны только чтобы
     не словить блокировку DataDome, см. обсуждение) и смотрим, ответил ли
     Playerok нормальным JSON'ом или отказом/403.
+
+    Возвращает (ok, detail) — detail это хвост реального вывода парсера
+    (или текст исключения), чтобы при неудаче было видно ПОЧЕМУ она
+    произошла, а не только красный крестик без объяснений (тот самый
+    урок про "тихий обрыв vs видимый 403 с телом ответа" из истории проекта).
     """
     cmd = [cfg["python"], "-u", cfg["entry"], "debug", "--proxy", pair["proxy"], "--cookies-file", pair["cookies_file"]]
     if pair.get("user_agent"):
@@ -922,12 +927,17 @@ async def _verify_pair(cfg: dict, pair: dict) -> bool:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return False
+            return False, "таймаут 25 сек — прокси не ответил вовреме (мёртв или блокирует соединение)"
         text = stdout.decode("utf-8", errors="replace")
-        return "ОК:" in text and "Запрос не удался" not in text
+        ok = "ОК:" in text and "Запрос не удался" not in text
+        # Последние строки реального вывода — там и текст ошибки requests/
+        # traceback, если сам процесс упал не через штатный PlayerokClientError
+        # (например при отсутствии pip-пакета для SOCKS5 — см. requirements.txt).
+        tail = "\n".join(text.strip().splitlines()[-6:]) if text.strip() else "(процесс ничего не вывел)"
+        return ok, tail
     except Exception as e:
         logger.warning("Ошибка проверки пары прокси+куки: %s", e)
-        return False
+        return False, f"не удалось запустить процесс проверки: {e}"
 
 
 def _strip_wrapping_quotes(s: str) -> str:
@@ -1089,10 +1099,19 @@ async def cb_pair_check(call: CallbackQuery):
     as_caption = bool(call.message.document)
 
     async def _check_and_refresh():
-        ok = await _verify_pair(cfg, pair)
+        ok, detail = await _verify_pair(cfg, pair)
         proxy_pairs.update_pair(service_id, pair_id, verified=ok)
         await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
                           _pool_text(service_id, cfg), _pool_keyboard(service_id, cfg), as_caption)
+        # Отдельным сообщением — реальный хвост вывода парсера, а не только
+        # смена эмодзи в карточке: иначе при неудаче совершенно не видно,
+        # ПОЧЕМУ не сработало (мёртвый прокси? нет пакета для SOCKS5? 403?).
+        verdict = "✅ Пара рабочая" if ok else "❌ Проверка не прошла"
+        await call.message.bot.send_message(
+            call.message.chat.id,
+            f"{verdict} (пара #{pair_id}):\n<pre>{html.escape(detail)}</pre>",
+            parse_mode="HTML",
+        )
 
     _fire_and_forget(_check_and_refresh())
 
