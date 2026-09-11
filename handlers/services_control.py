@@ -77,6 +77,13 @@ def _footer_description(cfg: dict) -> str:
 
 _view_state: dict[tuple[int, int], tuple] = {}
 
+# Какие отложенные потоки уже получили уведомление "реально начал собирать".
+# In-memory и намеренно НЕ переживает перезапуск Shinoa (сбрасывается) — это
+# best-effort уведомление, а не источник истины о состоянии сбора (тот — сам
+# status.json на диске), так что при рестарте максимум разово продублируется
+# уведомление, если поток как раз ждал старта в этот момент — не критично.
+_delayed_start_notified: set[tuple[str, int]] = set()
+
 
 def _set_view(chat_id: int, message_id: int, kind: str, service_id: str,
                run_id: int | None = None, as_caption: bool = False) -> None:
@@ -481,12 +488,27 @@ def _thread_text(service_id: str, cfg: dict, run_id: int) -> str:
         f"<b>Прогресс</b>: {_progress_line(status)}",
     ]
     if params.get("test"):
-        lines.append("Режим: тест (~2 мин)")
+        # Длительность теста рандомная (0:40–2:59, см. main.py) — точный мм:сс
+        # из status.json (пишется парсером ДО первого опроса), а не округлённый
+        # _fmt_duration (он даёт только целые минуты — на диапазоне 40-179 сек
+        # это всего 3 разных значения, теряя как раз ту точность, ради которой
+        # длительность и рандомизировалась).
+        total_seconds = (status or {}).get("total_seconds")
+        if total_seconds is not None:
+            mm, ss = divmod(round(total_seconds), 60)
+            lines.append(f"Режим: тест (~{mm}:{ss:02d})")
+        else:
+            lines.append("Режим: тест")
     else:
         remaining = _fmt_duration((status or {}).get("remaining_seconds"))
         total = _fmt_duration((status or {}).get("total_seconds"))
         if remaining and total:
             lines.append(f"<b>Осталось</b>: {remaining} из {total}")
+
+    settings_lines = _run_settings_lines(service_id, run_id, cfg)
+    if settings_lines:
+        lines.append("")
+        lines.extend(settings_lines)
 
     return "\n".join(lines) + paused_note
 
@@ -1111,6 +1133,9 @@ async def cb_pair_check(call: CallbackQuery):
             call.message.chat.id,
             f"{verdict} (пара #{pair_id}):\n<pre>{html.escape(detail)}</pre>",
             parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_message")]
+            ]),
         )
 
     _fire_and_forget(_check_and_refresh())
@@ -1441,6 +1466,31 @@ def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
         viewer = _find_thread_viewer(service_id, run_id)
         try:
             if st == "running":
+                # Отложенный старт: пока парсер ждёт своего времени, он пишет
+                # progress_text="ожидание старта в ЧЧ:ММ (...)" (main.py). Как
+                # только это поле сменилось на что-то другое ("старт"/"опрос N")
+                # — значит ожидание закончилось и реальный запрос УЖЕ ушёл (в
+                # main.py resolve_niche() выполняется ДО первой записи "старт" в
+                # status.json, так что это не "вот-вот", а "уже фактически").
+                # Шлём один раз, не на каждый опрос — трекаем через
+                # _delayed_start_notified.
+                key = (service_id, run_id)
+                progress_text = status.get("progress_text") or ""
+                params_for_thread = mgr.get_params(service_id, run_id) or {}
+                if (params_for_thread.get("start_at")
+                        and not progress_text.startswith("ожидание старта")
+                        and key not in _delayed_start_notified):
+                    _delayed_start_notified.add(key)
+                    title = status.get("niche_title") or params_for_thread.get("url") or "—"
+                    await bot.send_message(
+                        chat_id,
+                        f"▶️ Отложенный поток начал сбор: <b>{html.escape(str(title))}</b>",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_message")]
+                        ]),
+                    )
+
                 # Живое обновление % прогресса — только если это самое
                 # сообщение прямо сейчас показывает карточку именно этого
                 # потока. Иначе молчим: экран увидит актуальные данные сам,
@@ -1452,6 +1502,7 @@ def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
                                       _thread_keyboard(service_id, run_id, minimal=v_caption), v_caption)
                 return
 
+            _delayed_start_notified.discard((service_id, run_id))
             title = _run_title(service_id, run_id, status, cfg)
             text, result_file = _final_result_caption(cfg, title, status)
 
