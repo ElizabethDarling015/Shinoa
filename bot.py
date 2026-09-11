@@ -30,6 +30,7 @@ from config import BOT_TOKEN, DEFAULT_TIMEZONE, ALLOWED_USERS
 from handlers import main_router, set_scheduler
 from scheduler import ReminderScheduler
 from middlewares.access import AccessMiddleware
+from middlewares.view_state_cleanup import ViewStateCleanupMiddleware
 from services.bot_session import ProxySwitchableSession
 
 
@@ -414,6 +415,9 @@ async def main():
     # Подключение middleware для ограничения доступа
     # ──────────────────────────────────────────
     dp.update.middleware(AccessMiddleware())
+    # Чинит перезапись чужого меню живым обновлением карточки потока Playerok —
+    # см. подробный разбор в самом файле middleware.
+    dp.update.middleware(ViewStateCleanupMiddleware())
 
     dp.include_router(main_router)
     dp.include_router(goodbye_router)   # ← роутер для кнопки прощания
