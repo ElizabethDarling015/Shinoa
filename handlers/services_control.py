@@ -19,6 +19,7 @@
 import asyncio
 import logging
 import html
+import json
 import os
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -856,7 +857,8 @@ def _pool_text(service_id: str, cfg: dict) -> str:
             geo = p.get("geo") or "гео не определено"
             v = p.get("verified")
             v_emoji = "✅" if v is True else ("❌" if v is False else "🔸")
-            lines.append(f"{v_emoji} <b>Пара #{p['id']}</b> — {html.escape(geo)} · занято {used}/{mgr.MAX_THREADS_PER_PAIR}")
+            ua_note = "" if p.get("user_agent") else " · ⚠️ без UA (свой из config.py парсера)"
+            lines.append(f"{v_emoji} <b>Пара #{p['id']}</b> — {html.escape(geo)} · занято {used}/{mgr.MAX_THREADS_PER_PAIR}{ua_note}")
         lines.append("")
         lines.append(f"Новый поток берёт наименее занятую пару (до {mgr.MAX_THREADS_PER_PAIR} потоков на каждую). "
                       "Если все заняты — запуск нового потока будет отклонён, а не пойдёт в обход лимита.")
@@ -908,6 +910,8 @@ async def _verify_pair(cfg: dict, pair: dict) -> bool:
     Playerok нормальным JSON'ом или отказом/403.
     """
     cmd = [cfg["python"], "-u", cfg["entry"], "debug", "--proxy", pair["proxy"], "--cookies-file", pair["cookies_file"]]
+    if pair.get("user_agent"):
+        cmd += ["--user-agent", pair["user_agent"]]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=cfg.get("cwd"),
@@ -926,6 +930,42 @@ async def _verify_pair(cfg: dict, pair: dict) -> bool:
         return False
 
 
+def _strip_wrapping_quotes(s: str) -> str:
+    """Срезает один слой обрамляющих ' или " — частая ошибка при копировании
+    значения (например UA) из консоли DevTools, где REPL печатает строки в
+    кавычках как часть визуального вывода, а не как часть самого значения."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
+async def _finish_pair_creation(bot, data: dict, service_id: str, proxy: str,
+                                 cookies_text: str, user_agent: str | None) -> None:
+    """Общий хвост создания пары — что для одношагового JSON-ввода, что для
+    старого двухшагового (прокси отдельно, куки отдельно)."""
+    as_caption = data.get("as_caption", False)
+    cfg = get_service(service_id)
+
+    pair = proxy_pairs.add_pair(service_id, proxy, cookies_file="", user_agent=user_agent)
+    cookies_path = mgr.STATUS_DIR / f"{service_id}_pair_{pair['id']}_cookies.txt"
+    cookies_path.write_text(cookies_text, encoding="utf-8")
+    proxy_pairs.update_pair(service_id, pair["id"], cookies_file=str(cookies_path))
+
+    _set_view(data["card_chat_id"], data["card_msg_id"], "card", service_id)
+    await _edit_card(
+        bot, data["card_chat_id"], data["card_msg_id"],
+        f"⏳ Пара #{pair['id']} добавлена, определяю геолокацию прокси...",
+        InlineKeyboardMarkup(inline_keyboard=[]), as_caption,
+    )
+
+    geo = await _lookup_proxy_geo(proxy)
+    proxy_pairs.update_pair(service_id, pair["id"], geo=geo)
+
+    await _edit_card(bot, data["card_chat_id"], data["card_msg_id"],
+                      _pool_text(service_id, cfg), _pool_keyboard(service_id, cfg), as_caption)
+
+
 @router.callback_query(F.data.startswith("pair_add:"))
 async def cb_pair_add(call: CallbackQuery, state: FSMContext):
     service_id = call.data.split(":", 1)[1]
@@ -942,8 +982,12 @@ async def cb_pair_add(call: CallbackQuery, state: FSMContext):
     )
     _set_view(call.message.chat.id, call.message.message_id, "input", service_id)
     prompt = (
-        "Пришли адрес прокси для новой пары, например:\n"
-        "<code>http://user:pass@host:port</code> или <code>socks5://host:port</code>"
+        "Пришли данные для новой пары — либо всё <b>одним сообщением</b> как JSON "
+        "(рекомендуется, кука/прокси/UA гарантированно не разъедутся):\n"
+        '<code>{"cookie": "...", "proxy": "...", "user_agent": "..."}</code>\n\n'
+        "Либо по старинке, отдельным сообщением просто адрес прокси, например:\n"
+        "<code>http://user:pass@host:port</code> или <code>socks5://host:port</code>\n"
+        "(тогда следующим шагом спрошу куки отдельно, а UA возьмётся из config.py парсера)."
     )
     await _edit_card(call.message.bot, call.message.chat.id, call.message.message_id,
                       prompt, _cancel_keyboard(service_id), as_caption)
@@ -951,32 +995,61 @@ async def cb_pair_add(call: CallbackQuery, state: FSMContext):
 
 @router.message(PairInput.waiting_proxy, lambda m: not _is_command(m))
 async def step_pair_proxy(message: Message, state: FSMContext):
-    proxy = (message.text or "").strip()
+    raw = (message.text or "").strip()
     data = await state.get_data()
+    service_id = data["service_id"]
+    as_caption = data.get("as_caption", False)
     try:
         await message.delete()
     except TelegramBadRequest:
         pass
 
-    if not proxy:
+    if not raw:
         await _edit_card(
             message.bot, data["card_chat_id"], data["card_msg_id"],
             "❌ Некорректные данные!\n\nПришли адрес прокси, например:\n"
-            "<code>http://user:pass@host:port</code> или <code>socks5://host:port</code>",
-            _cancel_keyboard(data["service_id"]), data.get("as_caption", False),
+            "<code>http://user:pass@host:port</code> или <code>socks5://host:port</code>\n"
+            "— либо весь JSON-блок одним сообщением (см. подсказку выше).",
+            _cancel_keyboard(service_id), as_caption,
         )
         return
 
-    await state.update_data(proxy=proxy)
+    # Одношаговый вариант — весь identity целиком одним сообщением.
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+            cookie = (payload.get("cookie") or "").strip()
+            proxy = _strip_wrapping_quotes((payload.get("proxy") or "").strip())
+            user_agent = _strip_wrapping_quotes((payload.get("user_agent") or "").strip()) or None
+        except (json.JSONDecodeError, AttributeError):
+            cookie = proxy = None
+
+        if not cookie or not proxy:
+            await _edit_card(
+                message.bot, data["card_chat_id"], data["card_msg_id"],
+                "❌ Некорректные данные!\n\nВ JSON обязательны непустые поля "
+                '"cookie" и "proxy" (user_agent — опционален). Пришли ещё раз, '
+                "либо просто адрес прокси отдельным сообщением, если хочешь по старинке.",
+                _cancel_keyboard(service_id), as_caption,
+            )
+            return
+
+        await state.clear()
+        await _finish_pair_creation(message.bot, data, service_id, proxy, cookie, user_agent)
+        return
+
+    # Старый двухшаговый вариант — сначала просто прокси.
+    await state.update_data(proxy=raw)
     await state.set_state(PairInput.waiting_cookies)
     prompt = (
         "Теперь пришли содержимое cookie-файла для ЭТОЙ ЖЕ пары — тот же формат, "
         "что в <code>session_cookies.txt</code> (открой playerok.com в браузере под "
         "нужным аккаунтом/сессией, DevTools → Network → любой запрос к graphql → "
-        "заголовок Cookie → скопируй значение целиком)."
+        "заголовок Cookie → скопируй значение целиком). UA в этом режиме не "
+        "запрашиваю — парсер возьмёт свой из config.py."
     )
     await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"],
-                      prompt, _cancel_keyboard(data["service_id"]), data.get("as_caption", False))
+                      prompt, _cancel_keyboard(service_id), as_caption)
 
 
 @router.message(PairInput.waiting_cookies, lambda m: not _is_command(m))
@@ -1000,25 +1073,7 @@ async def step_pair_cookies(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    cfg = get_service(service_id)
-
-    pair = proxy_pairs.add_pair(service_id, proxy, cookies_file="")
-    cookies_path = mgr.STATUS_DIR / f"{service_id}_pair_{pair['id']}_cookies.txt"
-    cookies_path.write_text(cookies_text, encoding="utf-8")
-    proxy_pairs.update_pair(service_id, pair["id"], cookies_file=str(cookies_path))
-
-    _set_view(data["card_chat_id"], data["card_msg_id"], "card", service_id)
-    await _edit_card(
-        message.bot, data["card_chat_id"], data["card_msg_id"],
-        f"⏳ Пара #{pair['id']} добавлена, определяю геолокацию прокси...",
-        InlineKeyboardMarkup(inline_keyboard=[]), as_caption,
-    )
-
-    geo = await _lookup_proxy_geo(proxy)
-    proxy_pairs.update_pair(service_id, pair["id"], geo=geo)
-
-    await _edit_card(message.bot, data["card_chat_id"], data["card_msg_id"],
-                      _pool_text(service_id, cfg), _pool_keyboard(service_id, cfg), as_caption)
+    await _finish_pair_creation(message.bot, data, service_id, proxy, cookies_text, user_agent=None)
 
 
 @router.callback_query(F.data.startswith("pair_check:"))

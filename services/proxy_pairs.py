@@ -22,6 +22,10 @@ STATUS_DIR напрямую, чтобы не тянуть циклическую
     "id": 1,                              # стабильный номер, не переиспользуется
     "proxy": "http://user:pass@host:port",
     "cookies_file": "/tmp/.../playerok_pair_1_cookies.txt",
+    "user_agent": "Mozilla/5.0 ..." | None,  # см. handlers/services_control.py —
+                                              # можно вставить одним JSON-блоком
+                                              # сразу с прокси+кукой+UA, чтобы не
+                                              # рассинхронить их между собой
     "geo": "Германия, Франкфурт" | None,   # определяется при добавлении, best-effort
     "verified": True | False | None,       # None — ещё не проверялась
 }
@@ -63,12 +67,13 @@ def _save_pairs(service_id: str, pairs: list) -> None:
     tmp.replace(f)
 
 
-def add_pair(service_id: str, proxy: str, cookies_file: str) -> dict:
+def add_pair(service_id: str, proxy: str, cookies_file: str, user_agent: str = None) -> dict:
     """cookies_file — уже готовый путь к файлу с текстом кук на диске
     (пишет вызывающая сторона — см. handlers/services_control.py)."""
     pairs = get_pairs(service_id)
     next_id = max((p["id"] for p in pairs), default=0) + 1
-    pair = {"id": next_id, "proxy": proxy, "cookies_file": cookies_file, "geo": None, "verified": None}
+    pair = {"id": next_id, "proxy": proxy, "cookies_file": cookies_file,
+            "user_agent": user_agent, "geo": None, "verified": None}
     pairs.append(pair)
     _save_pairs(service_id, pairs)
     return pair

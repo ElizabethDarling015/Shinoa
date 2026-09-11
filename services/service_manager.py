@@ -322,7 +322,7 @@ def set_test_mode(service_id: str, mode: str) -> None:
 
 
 def _build_command(service_id: str, cfg: dict, params: dict, status_file: Path,
-                    proxy: str = None, cookies_file: str = None) -> list[str]:
+                    proxy: str = None, cookies_file: str = None, user_agent: str = None) -> list[str]:
     """Собирает командную строку запуска под конкретный сервис из реестра + параметры пользователя."""
     # -u (unbuffered) — без него print() в дочернем процессе буферизуется
     # блоками, когда вывод идёт не в терминал, а в файл (наш .log): свежие
@@ -363,6 +363,13 @@ def _build_command(service_id: str, cfg: dict, params: dict, status_file: Path,
         cmd += ["--proxy", proxy]
     if cookies_file:
         cmd += ["--cookies-file", cookies_file]
+    if user_agent:
+        # Держим UA В ПАРЕ с прокси/кукой (см. proxy_pairs.py) — снят той же
+        # браузерной сессией, что и кука, а не берётся из глобального
+        # config.py парсера. Если не задан (пара добавлена старым способом,
+        # без UA, или сервис вообще без пула прокси) — парсер тихо падает
+        # обратно на свой config.USER_AGENT, ничего не ломается.
+        cmd += ["--user-agent", user_agent]
 
     # Старый общий механизм настроек (service_registry.py: "settings") — для
     # сервисов БЕЗ пула прокси/кук (use_proxy_pool), простые одиночные поля.
@@ -475,6 +482,7 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
         service_id, cfg, params, status_file,
         proxy=pair["proxy"] if pair else None,
         cookies_file=pair["cookies_file"] if pair else None,
+        user_agent=pair.get("user_agent") if pair else None,
     )
     logger.info("Запускаю сервис %s (поток #%d%s): %s", service_id, run_id,
                 f", пара #{pair['id']}" if pair else "", " ".join(cmd))
