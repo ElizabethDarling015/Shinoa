@@ -77,13 +77,6 @@ def _footer_description(cfg: dict) -> str:
 
 _view_state: dict[tuple[int, int], tuple] = {}
 
-# Какие отложенные потоки уже получили уведомление "реально начал собирать".
-# In-memory и намеренно НЕ переживает перезапуск Shinoa (сбрасывается) — это
-# best-effort уведомление, а не источник истины о состоянии сбора (тот — сам
-# status.json на диске), так что при рестарте максимум разово продублируется
-# уведомление, если поток как раз ждал старта в этот момент — не критично.
-_delayed_start_notified: set[tuple[str, int]] = set()
-
 
 def _set_view(chat_id: int, message_id: int, kind: str, service_id: str,
                run_id: int | None = None, as_caption: bool = False) -> None:
@@ -1472,15 +1465,16 @@ def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
                 # — значит ожидание закончилось и реальный запрос УЖЕ ушёл (в
                 # main.py resolve_niche() выполняется ДО первой записи "старт" в
                 # status.json, так что это не "вот-вот", а "уже фактически").
-                # Шлём один раз, не на каждый опрос — трекаем через
-                # _delayed_start_notified.
-                key = (service_id, run_id)
+                # Шлём один раз, не на каждый опрос — трекаем ПЕРСИСТЕНТНО через
+                # registry.json (mgr.is/mark_delayed_notified), а не в памяти
+                # процесса: иначе рестарт Shinoa сбрасывает флаг, и уже давно
+                # идущий поток получает это уведомление заново на каждый рестарт.
                 progress_text = status.get("progress_text") or ""
                 params_for_thread = mgr.get_params(service_id, run_id) or {}
                 if (params_for_thread.get("start_at")
                         and not progress_text.startswith("ожидание старта")
-                        and key not in _delayed_start_notified):
-                    _delayed_start_notified.add(key)
+                        and not mgr.is_delayed_notified(service_id, run_id)):
+                    mgr.mark_delayed_notified(service_id, run_id)
                     title = status.get("niche_title") or params_for_thread.get("url") or "—"
                     await bot.send_message(
                         chat_id,
@@ -1502,7 +1496,6 @@ def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
                                       _thread_keyboard(service_id, run_id, minimal=v_caption), v_caption)
                 return
 
-            _delayed_start_notified.discard((service_id, run_id))
             title = _run_title(service_id, run_id, status, cfg)
             text, result_file = _final_result_caption(cfg, title, status)
 

@@ -192,6 +192,21 @@ def is_paused(service_id: str, run_id: int) -> bool:
     return bool(entry and entry.get("paused"))
 
 
+def is_delayed_notified(service_id: str, run_id: int) -> bool:
+    """Уже отправляли уведомление 'отложенный поток начал сбор' для этого
+    потока? Персистентно (registry.json), не в памяти — переживает рестарт
+    Shinoa, чтобы не слать уведомление повторно на каждый перезапуск."""
+    entry = _running.get(service_id, {}).get(run_id)
+    return bool(entry and entry.get("delayed_notified"))
+
+
+def mark_delayed_notified(service_id: str, run_id: int) -> None:
+    entry = _running.get(service_id, {}).get(run_id)
+    if entry is not None:
+        entry["delayed_notified"] = True
+        _dump_registry()
+
+
 def get_params(service_id: str, run_id: int) -> dict | None:
     entry = _runs(service_id).get(run_id)
     return entry["params"] if entry else None
@@ -406,6 +421,7 @@ def _dump_registry() -> None:
                 "started_at": entry["started_at"],
                 "paused": entry["paused"],
                 "pair_id": entry.get("pair_id"),
+                "delayed_notified": entry.get("delayed_notified", False),
             }
     tmp = REGISTRY_FILE.with_suffix(".json.tmp")
     try:
@@ -523,6 +539,7 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
         "params": params,
         "started_at": started_at,
         "paused": False,
+        "delayed_notified": False,
     }
     _dump_registry()
     return run_id
@@ -765,6 +782,7 @@ async def recover(on_update_factory) -> list[tuple[str, int, str]]:
                 "started_at": entry["started_at"],
                 "paused": entry.get("paused", False),
                 "pair_id": entry.get("pair_id"),
+                "delayed_notified": entry.get("delayed_notified", False),
             }
             _next_run_id[service_id] = max(_next_run_id.get(service_id, 1), run_id + 1)
             logger.info("Восстановлена связь с потоком %s #%d (pid=%d)", service_id, run_id, pid)

@@ -13,8 +13,9 @@ from pathlib import Path
 from datetime import datetime, date
 
 import aiosqlite
+import pytz
 
-from config import DB_PATH
+from config import DB_PATH, DEFAULT_TIMEZONE
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,17 @@ async def run_migrations():
             logger.info("Миграция %d применена", version)
 
 
+def _local_today() -> date:
+    """
+    Сегодняшняя дата в часовом поясе бота (DEFAULT_TIMEZONE из .env), а не в
+    системном часовом поясе машины — иначе имя ночного бэкапа может уехать
+    на день относительно того, когда CronTrigger реально сработал в 03:00
+    по настроенному TIMEZONE (баг, из-за которого файл за "11 сентября"
+    появлялся с меткой времени "10 сентября, 21:58").
+    """
+    return datetime.now(pytz.timezone(DEFAULT_TIMEZONE)).date()
+
+
 def _backup_before_migration(current_version: int):
     src = Path(DB_PATH)
     if not src.exists():
@@ -81,7 +93,7 @@ def _backup_before_migration(current_version: int):
     
     backups_dir = Path("backups")
     backups_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(pytz.timezone(DEFAULT_TIMEZONE)).strftime("%Y%m%d_%H%M%S")
     dst = backups_dir / f"pre_migration_v{current_version}_{timestamp}.db"
     
     # Выполняем синхронное копирование в отдельном потоке, чтобы не блокировать asyncio
@@ -93,7 +105,7 @@ def _backup_before_migration(current_version: int):
 
 
 async def backup_database():
-    """Ночной бэкап, вызывается планировщиком каждую ночь в 03:00."""
+    """Ночной бэкап, вызывается планировщиком каждую ночь в 03:00 (по DEFAULT_TIMEZONE)."""
     src = Path(DB_PATH)
     if not src.exists():
         return
@@ -101,14 +113,14 @@ async def backup_database():
     backups_dir = Path("backups")
     backups_dir.mkdir(exist_ok=True)
 
-    dst = backups_dir / f"daily_{date.today()}.db"
+    dst = backups_dir / f"daily_{_local_today()}.db"
     shutil.copy2(src, dst)
     logger.info("Ночной бэкап создан: %s", dst)
 
     for old_backup in backups_dir.glob("daily_*.db"):
         try:
             backup_date = date.fromisoformat(old_backup.stem.replace("daily_", ""))
-            if (date.today() - backup_date).days > 30:
+            if (_local_today() - backup_date).days > 30:
                 old_backup.unlink()
                 logger.info("Удалён старый бэкап: %s", old_backup)
         except ValueError:
