@@ -32,11 +32,12 @@ STATUS_DIR напрямую, чтобы не тянуть циклическую
 """
 
 import json
-import tempfile
+import logging
 from pathlib import Path
 
-STATUS_DIR = Path(tempfile.gettempdir()) / "shinoa_service_status"
-STATUS_DIR.mkdir(exist_ok=True)
+from services.paths import STATUS_DIR
+
+logger = logging.getLogger(__name__)
 
 
 def _pairs_file(service_id: str) -> Path:
@@ -49,7 +50,8 @@ def get_pairs(service_id: str) -> list:
         return []
     try:
         return json.loads(f.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Не удалось прочитать %s: %s — отдаю пустой список (НЕ перезаписываю файл)", f, e)
         return []
 
 
@@ -76,6 +78,8 @@ def add_pair(service_id: str, proxy: str, cookies_file: str, user_agent: str = N
             "user_agent": user_agent, "geo": None, "verified": None}
     pairs.append(pair)
     _save_pairs(service_id, pairs)
+    logger.info("proxy_pairs[%s]: добавлена пара #%s (было %d пар, стало %d)",
+                service_id, next_id, len(pairs) - 1, len(pairs))
     return pair
 
 
@@ -86,8 +90,11 @@ def remove_pair(service_id: str, pair_id: int) -> bool:
     pairs = get_pairs(service_id)
     new_pairs = [p for p in pairs if p["id"] != pair_id]
     if len(new_pairs) == len(pairs):
+        logger.warning("proxy_pairs[%s]: попытка удалить несуществующую пару #%s", service_id, pair_id)
         return False
     _save_pairs(service_id, new_pairs)
+    logger.info("proxy_pairs[%s]: удалена пара #%s (было %d пар, стало %d)",
+                service_id, pair_id, len(pairs), len(new_pairs))
     return True
 
 
@@ -97,4 +104,7 @@ def update_pair(service_id: str, pair_id: int, **fields) -> None:
         if p["id"] == pair_id:
             p.update(fields)
             break
+    else:
+        logger.warning("proxy_pairs[%s]: update_pair для несуществующей пары #%s, поля=%s",
+                        service_id, pair_id, fields)
     _save_pairs(service_id, pairs)

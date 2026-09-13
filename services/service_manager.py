@@ -103,18 +103,16 @@ import logging
 import os
 import signal
 import subprocess
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from services.service_registry import get_service
 from services import proxy_pairs
+from services.paths import STATUS_DIR
 
 logger = logging.getLogger(__name__)
 
-STATUS_DIR = Path(tempfile.gettempdir()) / "shinoa_service_status"
-STATUS_DIR.mkdir(exist_ok=True)
 REGISTRY_FILE = STATUS_DIR / "registry.json"
 
 # Сколько активных потоков разрешено одновременно на одну пару прокси+куки

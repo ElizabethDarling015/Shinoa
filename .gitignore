@@ -3,6 +3,7 @@
 .env.local
 .env.production
 !.env.example
+var/
 
 # База данных
 bot.db
