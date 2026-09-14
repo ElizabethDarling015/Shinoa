@@ -220,6 +220,15 @@ def get_log_file(service_id: str, run_id: int) -> Path | None:
     return entry["log_file"] if entry else None
 
 
+def get_status_file(service_id: str, run_id: int) -> Path | None:
+    """Путь к status.json конкретного потока — нужен, чтобы вычислить путь к
+    events.jsonl (WARNING+ логи, см. logging_setup.py на стороне парсера):
+    тот же путь с суффиксом .events.jsonl вместо .json (см. _events_path в
+    services_control.py)."""
+    entry = _runs(service_id).get(run_id)
+    return entry["status_file"] if entry else None
+
+
 def get_cmd(service_id: str, run_id: int) -> list | None:
     """Полная командная строка, которой был реально запущен этот поток —
     зафиксирована один раз при старте (start()), не меняется, даже если

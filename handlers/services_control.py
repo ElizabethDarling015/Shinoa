@@ -280,6 +280,111 @@ def _thread_label(service_id: str, run_id: int) -> str:
     return f"{label} ({suffix})" if suffix else label
 
 
+_LEVEL_EMOJI = {"WARNING": "⚠️", "ERROR": "‼️", "CRITICAL": "🚫"}
+_EVENTS_MAX_LINES = 30      # см. обсуждение: "последние 30, если влезут"
+_EVENTS_CHAR_BUDGET = 3500  # с запасом от лимита Telegram в 4096 на всё сообщение
+
+
+def _events_path(service_id: str, run_id: int) -> Path | None:
+    """
+    events.jsonl лежит РЯДОМ со status.json, с тем же именем и суффиксом
+    .events.jsonl вместо .json — см. logging_setup.events_path_for() на
+    стороне парсера (тот же принцип воспроизведён здесь, без общего
+    контракта/поля в status.json ради одного пути).
+    """
+    status_file = mgr.get_status_file(service_id, run_id)
+    if not status_file:
+        return None
+    return status_file.with_suffix(".events.jsonl")
+
+
+def _counts_from_status(status: dict | None) -> tuple[int, int, int]:
+    """(warn, error, critical) — None из status.json (счётчики ещё не
+    настроены, см. main.py) трактуется как 0, не как "неизвестно"."""
+    status = status or {}
+    return (
+        status.get("warn_count") or 0,
+        status.get("error_count") or 0,
+        status.get("critical_count") or 0,
+    )
+
+
+def _counts_line(status: dict | None, force: bool = False) -> str | None:
+    """
+    Строка вида "⚠️:5 ‼️:1 🚫:0". По умолчанию (force=False) — None (строка
+    не рисуется вообще), пока хотя бы один счётчик не станет положительным —
+    именно это "по умолчанию скрыты" из обсуждения. force=True — для
+    итогового уведомления по завершении потока, где строка нужна ВСЕГДА,
+    даже по нулям (чтобы можно было безусловно ожидать её в тексте).
+    """
+    warn, err, crit = _counts_from_status(status)
+    if not force and warn == 0 and err == 0 and crit == 0:
+        return None
+    return f"{_LEVEL_EMOJI['WARNING']}:{warn} {_LEVEL_EMOJI['ERROR']}:{err} {_LEVEL_EMOJI['CRITICAL']}:{crit}"
+
+
+def _read_last_events(events_path: Path) -> tuple[list[str], int]:
+    """
+    Читает events.jsonl и возвращает (строки_для_показа, всего_записей).
+    Строки — уже отформатированный HTML-текст с эмодзи уровня и локальным
+    временем (Екатеринбург, как и везде в Shinoa). Берёт последние
+    _EVENTS_MAX_LINES, но дополнительно подрезает по _EVENTS_CHAR_BUDGET,
+    если даже 30 коротких строк почему-то не влезли (длинные message).
+    """
+    try:
+        raw_lines = events_path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        return [], 0
+
+    total = len(raw_lines)
+    selected = raw_lines[-_EVENTS_MAX_LINES:]
+
+    formatted = []
+    for line in selected:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        level = entry.get("level", "")
+        emoji = _LEVEL_EMOJI.get(level, "•")
+        ts_raw = entry.get("ts", "")
+        try:
+            ts_local = datetime.fromisoformat(ts_raw) + _YEKAT_OFFSET
+            ts_str = ts_local.strftime("%H:%M:%S")
+        except ValueError:
+            ts_str = "??:??:??"
+        message = html.escape(str(entry.get("message", "")))
+        formatted.append(f"{emoji} <code>{ts_str}</code> {message}")
+
+    # Если даже после отбора по числу строк не влезаем в бюджет символов —
+    # отрезаем с начала (самые старые из уже отобранных), самые свежие важнее.
+    while formatted and sum(len(x) for x in formatted) > _EVENTS_CHAR_BUDGET:
+        formatted.pop(0)
+
+    return formatted, total
+
+
+def _events_text(service_id: str, run_id: int, cfg: dict) -> str:
+    status = mgr.read_status(service_id, run_id)
+    title = _run_title(service_id, run_id, status or {}, cfg)
+    events_path = _events_path(service_id, run_id)
+    if not events_path:
+        return f"<b>{html.escape(cfg['title'])} — {html.escape(str(title))}</b>\n\nЛоги недоступны (поток не найден)."
+
+    lines, total = _read_last_events(events_path)
+    warn, err, crit = _counts_from_status(status)
+    header = (f"<b>{html.escape(cfg['title'])} — {html.escape(str(title))}</b>\n"
+              f"Всего: {_LEVEL_EMOJI['WARNING']}:{warn} {_LEVEL_EMOJI['ERROR']}:{err} "
+              f"{_LEVEL_EMOJI['CRITICAL']}:{crit}")
+
+    if not lines:
+        return f"{header}\n\nПока нет ни одного warning/error/critical — всё чисто."
+
+    shown = len(lines)
+    note = f"\n\n<i>Показаны последние {shown} из {total}</i>" if shown < total else ""
+    return f"{header}\n\n" + "\n".join(lines) + note
+
+
 # ──────────────────────────────────────────────────────────
 # Клавиатуры и тексты — главная карточка сервиса (список потоков)
 # ──────────────────────────────────────────────────────────
@@ -413,7 +518,11 @@ def _card_text(service_id: str, cfg: dict) -> str:
                 time_str = "старт"
 
             head = f"{dot} <b>{i}. {html.escape(str(title))}</b>. ({time_str}). {percent_str}"
-            block_lines = [head] + _run_settings_lines(service_id, rid, cfg) + [f"<code>{html.escape(url)}</code>"]
+            counts_line = _counts_line(status)
+            block_lines = [head] + _run_settings_lines(service_id, rid, cfg)
+            if counts_line:
+                block_lines.append(counts_line)
+            block_lines.append(f"<code>{html.escape(url)}</code>")
             blocks.append("\n".join(block_lines))
         # Разделитель между потоками — сейчас у каждого блока по 4 строки
         # (заголовок, прокси, куки, ссылка); без пустых строк вокруг черты,
@@ -451,6 +560,7 @@ def _thread_keyboard(service_id: str, run_id: int, minimal: bool = False) -> Inl
     )
     rows = [
         [pause_btn, InlineKeyboardButton(text="🗑 Удалить поток", callback_data=f"svc_delete_thread:{service_id}:{run_id}")],
+        [InlineKeyboardButton(text="📋 Логи", callback_data=f"svc_logs:{service_id}:{run_id}")],
     ]
     if minimal:
         rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="svc_close")])
@@ -639,6 +749,32 @@ async def cb_svc_close(call: CallbackQuery):
         await call.message.delete()
     except TelegramBadRequest:
         pass
+
+
+@router.callback_query(F.data.startswith("svc_logs:"))
+async def cb_svc_logs(call: CallbackQuery):
+    """
+    Шлёт НОВЫМ сообщением последние warning/error/critical этого потока (см.
+    _events_text) — не редактирует карточку потока, чтобы не терять её из
+    виду и не тащить длинный список логов в основную навигацию. Кнопка
+    "Закрыть" на этом сообщении переиспользует общий cb_svc_close выше —
+    оно ничем не отличается от любого другого "одноразового" сообщения.
+    """
+    _, service_id, run_id = call.data.split(":")
+    run_id = int(run_id)
+    cfg = get_service(service_id)
+    await call.answer()
+    if not cfg:
+        await call.message.answer("❌ Сервис не найден в реестре.")
+        return
+    text = _events_text(service_id, run_id, cfg)
+    await call.message.bot.send_message(
+        call.message.chat.id, text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Закрыть", callback_data="svc_close")],
+        ]),
+        disable_web_page_preview=True,
+    )
 
 
 def _settings_text(cfg: dict, service_id: str) -> str:
@@ -1388,13 +1524,20 @@ def _final_result_caption(cfg: dict, title: str, status: dict) -> tuple[str, str
     "результат придёт сюда же" плейсхолдера (см. _deliver_result_by_edit,
     используется при досрочной остановке потока). Возвращает (текст, путь_к_файлу
     или None — файл есть только у "done", да и то не всегда).
+
+    Строка со счётчиками warning/error/critical добавляется В ЛЮБОМ случае,
+    даже по нулям (force=True) — в отличие от _counts_line в главном списке
+    (там строка по умолчанию скрыта), здесь она нужна безусловно, чтобы её
+    можно было ожидать в конце любого итогового уведомления.
     """
+    counts_line = _counts_line(status, force=True)
     if status.get("status") == "done":
         summary = status.get("result_text") or "Готово, без сводки."
-        text = f"✅ <b>{cfg['title']}</b> — {html.escape(str(title))} готово\n\n{summary}"
+        text = f"✅ <b>{cfg['title']}</b> — {html.escape(str(title))} готово\n\n{summary}\n\n{counts_line}"
         return text, status.get("result_file")
     err = status.get("error") or "неизвестная ошибка"
-    text = f"❌ <b>{cfg['title']}</b> — {html.escape(str(title))} — ошибка\n\n<code>{html.escape(err)}</code>"
+    text = (f"❌ <b>{cfg['title']}</b> — {html.escape(str(title))} — ошибка\n\n"
+            f"<code>{html.escape(err)}</code>\n\n{counts_line}")
     return text, None
 
 
