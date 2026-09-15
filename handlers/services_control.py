@@ -613,6 +613,10 @@ def _thread_text(service_id: str, cfg: dict, run_id: int) -> str:
         lines.append("")
         lines.extend(settings_lines)
 
+    counts_line = _counts_line(status)
+    if counts_line:
+        lines.append(counts_line)
+
     return "\n".join(lines) + paused_note
 
 
@@ -1676,6 +1680,35 @@ def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
         except TelegramBadRequest as e:
             if "message is not modified" not in str(e).lower():
                 logger.warning("Ошибка обновления карточки сервиса %s (поток %s): %s", service_id, run_id, e)
+        except Exception:
+            # ЛЮБОЕ другое исключение здесь раньше тихо убивало ВСЮ фоновую
+            # задачу _watch() целиком (см. service_manager.py) — WATCHER
+            # НИКОГДА не доходил до своей cleanup-ветки (registry/список
+            # потоков), и пользователь не получал ни файла, ни уведомления,
+            # ни объяснения, просто зависшую запись в списке навечно (баг,
+            # пойманный на практике: 24-часовой сбор долистал до конца,
+            # status.json был "done", а Shinoa молча ничего не доставила).
+            # Теперь: логируем ПОЛНЫЙ traceback (чтобы было что чинить) и
+            # ВСЁ РАВНО пытаемся довести до пользователя хоть что-то —
+            # голым текстом, без красивого форматирования — вместо полной
+            # тишины. cleanup дальше по коду (_watch/recover) в любом случае
+            # доберётся до своей ветки, раз исключение поймано именно здесь.
+            logger.exception(
+                "on_update упал на статусе %r для %s (поток %s) — доставляю аварийный fallback",
+                st, service_id, run_id,
+            )
+            if st in ("done", "error"):
+                try:
+                    result_file = status.get("result_file")
+                    fallback_text = (
+                        f"⚠️ {cfg['title']} — поток {run_id}: сбор завершён (статус: {st}), "
+                        f"но не удалось красиво оформить уведомление (см. логи Shinoa). "
+                        f"Файл на сервере: {result_file or 'нет'}"
+                    )
+                    await bot.send_message(chat_id, fallback_text)
+                except Exception:
+                    logger.exception("Аварийный fallback тоже не смог отправиться для %s (поток %s)",
+                                      service_id, run_id)
 
     return on_update
 
