@@ -205,6 +205,30 @@ def mark_delayed_notified(service_id: str, run_id: int) -> None:
         _dump_registry()
 
 
+def is_network_issue_notified(service_id: str, run_id: int) -> bool:
+    """Уже отправляли уведомление 'поток встал из-за сети' для ТЕКУЩЕГО
+    незакрытого случая обрыва? Персистентно (registry.json), как и
+    delayed_notified — переживает рестарт Shinoa. Сбрасывается обратно в
+    False при восстановлении связи (см. clear_network_issue_notified), чтобы
+    следующий отдельный обрыв снова дал ровно одно уведомление."""
+    entry = _running.get(service_id, {}).get(run_id)
+    return bool(entry and entry.get("network_issue_notified"))
+
+
+def mark_network_issue_notified(service_id: str, run_id: int) -> None:
+    entry = _running.get(service_id, {}).get(run_id)
+    if entry is not None:
+        entry["network_issue_notified"] = True
+        _dump_registry()
+
+
+def clear_network_issue_notified(service_id: str, run_id: int) -> None:
+    entry = _running.get(service_id, {}).get(run_id)
+    if entry is not None and entry.get("network_issue_notified"):
+        entry["network_issue_notified"] = False
+        _dump_registry()
+
+
 def get_params(service_id: str, run_id: int) -> dict | None:
     entry = _runs(service_id).get(run_id)
     return entry["params"] if entry else None
@@ -429,6 +453,7 @@ def _dump_registry() -> None:
                 "paused": entry["paused"],
                 "pair_id": entry.get("pair_id"),
                 "delayed_notified": entry.get("delayed_notified", False),
+                "network_issue_notified": entry.get("network_issue_notified", False),
             }
     tmp = REGISTRY_FILE.with_suffix(".json.tmp")
     try:
@@ -547,6 +572,7 @@ async def start(service_id: str, params: dict, chat_id: int, on_update=None, pol
         "started_at": started_at,
         "paused": False,
         "delayed_notified": False,
+        "network_issue_notified": False,
     }
     _dump_registry()
     return run_id
@@ -790,6 +816,7 @@ async def recover(on_update_factory) -> list[tuple[str, int, str]]:
                 "paused": entry.get("paused", False),
                 "pair_id": entry.get("pair_id"),
                 "delayed_notified": entry.get("delayed_notified", False),
+                "network_issue_notified": entry.get("network_issue_notified", False),
             }
             _next_run_id[service_id] = max(_next_run_id.get(service_id, 1), run_id + 1)
             logger.info("Восстановлена связь с потоком %s #%d (pid=%d)", service_id, run_id, pid)

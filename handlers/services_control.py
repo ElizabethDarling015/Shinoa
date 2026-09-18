@@ -21,6 +21,9 @@ import logging
 import html
 import json
 import os
+import zipfile
+import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -193,16 +196,30 @@ def _has_real_progress(status: dict | None) -> bool:
 
 
 def _status_dot(status: dict | None, paused: bool) -> str:
-    """⏸ на паузе, 🟡 пока нет ни одного реального замера, 🟢 как только пришли первые данные."""
+    """⏸ на паузе (вручную), 🔴 самопауза из-за обрыва сети (см. collector.py),
+    🟡 пока нет ни одного реального замера, 🟢 как только пришли первые данные."""
     if paused:
         return "⏸"
+    if (status or {}).get("status") == "network_paused":
+        return "🔴"
     return "🟢" if _has_real_progress(status) else "🟡"
+
+
+_NETWORK_STAGE_LABELS_SHORT = {
+    "internet": "нет сети",
+    "proxy": "не отвечает прокси",
+    "playerok": "не отвечает Playerok",
+}
 
 
 def _progress_line(status: dict | None) -> str:
     dot = "🟡" if not status else ("🟢" if _has_real_progress(status) else "🟡")
     if not status:
         return "🟡 Запускается..."
+    if status.get("status") == "network_paused":
+        stage = status.get("network_issue_stage")
+        label = _NETWORK_STAGE_LABELS_SHORT.get(stage, "проблема с соединением")
+        return f"🔴 На паузе — {label} (продолжит сам, когда восстановится)"
     percent = status.get("progress_percent")
     ptext = status.get("progress_text")
     if ptext and ptext.startswith("ожидание старта"):
@@ -831,11 +848,180 @@ def _settings_hub_keyboard(service_id: str, cfg: dict) -> InlineKeyboardMarkup:
     buttons.append(InlineKeyboardButton(text="🧪 Режим тестирования", callback_data=f"svc_settings_testmode:{service_id}"))
 
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    # Отдельная, явная строка — не через общий auto-chunking выше, чтобы
+    # порядок "экспорт | удалить" не съехал, если у сервиса появится/пропадёт
+    # кнопка "Параметры" и общее число кнопок в первом блоке станет нечётным.
+    rows.append([
+        InlineKeyboardButton(text="📤 Выгрузить репорты/логи", callback_data=f"svc_export_rl:{service_id}"),
+        InlineKeyboardButton(text="🗑 Удалить репорты/логи", callback_data=f"svc_delete_rl_ask:{service_id}"),
+    ])
     rows.append([
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"svc_open:{service_id}"),
         InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+REPORTS_DIR = Path.home() / "Desktop" / "reports"  # то же самое, что вычисляет
+# сам парсер в report_html.py — Shinoa и парсер работают под одним и тем же
+# пользователем на одной машине, поэтому Path.home() совпадает.
+
+
+def _service_logs_dir(cfg: dict) -> Path | None:
+    """logs/ конкретного сервиса — путь строится из его же cwd (.env), а не
+    хардкодится, по тому же принципу, что и во всём остальном service_registry."""
+    cwd = cfg.get("cwd")
+    return Path(cwd) / "logs" if cwd else None
+
+
+def _active_log_paths(service_id: str) -> set[str]:
+    """Абсолютные пути к logs/*.log, которые прямо сейчас принадлежат
+    активным (running ИЛИ network_paused ИЛИ поставленным на паузу
+    пользователем — всё это по факту 'ещё не завершившиеся') потокам этого
+    сервиса. Источник истины — поле status.json 'log_file' (см.
+    logging_setup.py/main.py на стороне парсера), а не сопоставление по
+    имени/времени файла — оно было бы ненадёжным при совпадении ниш."""
+    paths = set()
+    for run_id in mgr.list_runs(service_id):
+        status = mgr.read_status(service_id, run_id)
+        log_file = (status or {}).get("log_file")
+        if log_file:
+            try:
+                paths.add(str(Path(log_file).resolve()))
+            except OSError:
+                paths.add(log_file)
+    return paths
+
+
+@router.callback_query(F.data.startswith("svc_export_rl:"))
+async def cb_svc_export_rl(call: CallbackQuery):
+    service_id = call.data.split(":", 1)[1]
+    cfg = get_service(service_id)
+    if not cfg:
+        await call.answer("Сервис не найден", show_alert=True)
+        return
+    await call.answer("Собираю архивы…")
+
+    logs_dir = _service_logs_dir(cfg)
+    active_paths = _active_log_paths(service_id)
+    from aiogram.types import FSInputFile
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="shinoa_export_"))
+    try:
+        report_files = [f for f in REPORTS_DIR.iterdir() if f.is_file()] if REPORTS_DIR.exists() else []
+        if report_files:
+            reports_zip = tmp_dir / f"{service_id}_reports.zip"
+            with zipfile.ZipFile(reports_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in report_files:
+                    zf.write(f, arcname=f.name)
+            await call.message.answer_document(
+                FSInputFile(reports_zip), caption=f"📊 Отчёты — {cfg['title']} ({len(report_files)} шт.)",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="❌ Закрыть", callback_data="close_message")
+                ]]))
+        else:
+            await call.message.answer("📊 Папка с отчётами пуста — выгружать нечего.")
+
+        log_files_all = [f for f in logs_dir.iterdir() if f.is_file()] if logs_dir and logs_dir.exists() else []
+        log_files = [f for f in log_files_all if str(f.resolve()) not in active_paths]
+        skipped_active = len(log_files_all) - len(log_files)
+        if log_files:
+            logs_zip = tmp_dir / f"{service_id}_logs.zip"
+            with zipfile.ZipFile(logs_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in log_files:
+                    zf.write(f, arcname=f.name)
+            caption = f"📄 Логи завершённых потоков — {cfg['title']} ({len(log_files)} шт.)"
+            if skipped_active:
+                caption += f"\nПропущено активных/на паузе — {skipped_active} (их логи ещё пишутся, не трогаю)"
+            await call.message.answer_document(
+                FSInputFile(logs_zip), caption=caption,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="❌ Закрыть", callback_data="close_message")
+                ]]))
+        elif skipped_active:
+            await call.message.answer(
+                f"📄 Все {skipped_active} лог(ов) сейчас принадлежат активным/приостановленным "
+                f"потокам — выгружать пока нечего, завершённых потоков нет.")
+        else:
+            await call.message.answer("📄 Папка с логами пуста — выгружать нечего.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@router.callback_query(F.data.startswith("svc_delete_rl_ask:"))
+async def cb_svc_delete_rl_ask(call: CallbackQuery):
+    service_id = call.data.split(":", 1)[1]
+    cfg = get_service(service_id)
+    if not cfg:
+        await call.answer("Сервис не найден", show_alert=True)
+        return
+    active_paths = _active_log_paths(service_id)
+    note = (
+        f"\n\nЛоги {len(active_paths)} активных/приостановленных потоков не тронутся — "
+        f"удалятся только логи уже завершённых потоков."
+        if active_paths else ""
+    )
+    await call.answer()
+    as_caption = bool(call.message.document)
+    await _edit_card(
+        call.message.bot, call.message.chat.id, call.message.message_id,
+        f"Удалить отчёты и логи завершённых потоков сервиса «{cfg['title']}»? "
+        f"Это необратимо.{note}",
+        InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Да, удалить всё", callback_data=f"svc_delete_rl_confirm:{service_id}"),
+            InlineKeyboardButton(text="Отмена", callback_data=f"svc_settings:{service_id}"),
+        ]]),
+        as_caption,
+    )
+
+
+@router.callback_query(F.data.startswith("svc_delete_rl_confirm:"))
+async def cb_svc_delete_rl_confirm(call: CallbackQuery):
+    service_id = call.data.split(":", 1)[1]
+    cfg = get_service(service_id)
+    if not cfg:
+        await call.answer("Сервис не найден", show_alert=True)
+        return
+    await call.answer("Удаляю…")
+
+    logs_dir = _service_logs_dir(cfg)
+    active_paths = _active_log_paths(service_id)
+    reports_deleted = 0
+    logs_deleted = 0
+    logs_skipped = 0
+    if REPORTS_DIR.exists():
+        for f in REPORTS_DIR.iterdir():
+            if f.is_file():
+                try:
+                    f.unlink()
+                    reports_deleted += 1
+                except OSError:
+                    pass
+    if logs_dir and logs_dir.exists():
+        for f in logs_dir.iterdir():
+            if not f.is_file():
+                continue
+            if str(f.resolve()) in active_paths:
+                logs_skipped += 1
+                continue
+            try:
+                f.unlink()
+                logs_deleted += 1
+            except OSError:
+                pass
+
+    result_text = f"🗑 Готово — удалено отчётов: {reports_deleted}, файлов логов: {logs_deleted}."
+    if logs_skipped:
+        result_text += f"\nПропущено (активные/на паузе, не тронуты): {logs_skipped}."
+    as_caption = bool(call.message.document)
+    await _edit_card(
+        call.message.bot, call.message.chat.id, call.message.message_id,
+        result_text,
+        InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ К настройкам", callback_data=f"svc_settings:{service_id}"),
+        ]]),
+        as_caption,
+    )
 
 
 @router.callback_query(F.data.startswith("svc_settings_generic:"))
@@ -1601,11 +1787,62 @@ def _build_on_update(bot, service_id: str, cfg: dict, chat_id: int):
     уведомление о завершении, даже если никакой карточки этого потока сейчас
     не открыто нигде (например, сразу после restart).
     """
+    _NETWORK_STAGE_LABELS = {
+        "internet": "нет сети (похоже на выключенный VPN/интернет на устройстве)",
+        "proxy": "не отвечает прокси",
+        "playerok": "сеть и прокси в порядке — не отвечает сам Playerok",
+    }
+
     async def on_update(run_id: int, status: dict):
         st = status.get("status")
         viewer = _find_thread_viewer(service_id, run_id)
         try:
+            if st == "network_paused":
+                # Разовое push-уведомление на КАЖДЫЙ отдельный случай обрыва —
+                # не на каждый цикл _watch() (тот дёргает on_update раз в
+                # ~30 сек, пока status.json не поменяется). Флаг персистентный
+                # (registry.json), как и delayed_notified — переживает рестарт
+                # Shinoa, чтобы уже отправленное уведомление не задвоилось.
+                if not mgr.is_network_issue_notified(service_id, run_id):
+                    mgr.mark_network_issue_notified(service_id, run_id)
+                    stage = status.get("network_issue_stage")
+                    title = status.get("niche_title") or "—"
+                    label = _NETWORK_STAGE_LABELS.get(stage, "проблема с соединением")
+                    await bot.send_message(
+                        chat_id,
+                        f"⚠️ Поток встал на паузу: <b>{html.escape(str(title))}</b>\n"
+                        f"Похоже, {label}.\n"
+                        f"Поток сам продолжит сбор, как только связь восстановится — "
+                        f"чинить руками (пауза/старт) не нужно.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_message")]
+                        ]),
+                    )
+                if viewer:
+                    v_chat, v_msg, v_caption = viewer
+                    await _edit_card(bot, v_chat, v_msg, _thread_text(service_id, cfg, run_id),
+                                      _thread_keyboard(service_id, run_id, minimal=v_caption), v_caption)
+                return
+
             if st == "running":
+                # Если до этого был отправлен алерт "поток встал из-за сети" —
+                # раз status снова "running", значит связь восстановилась
+                # (см. collector.py: self-pause выходит из running только
+                # когда diagnose_connection перестаёт находить проблему).
+                # Сбрасываем флаг и один раз сообщаем о восстановлении —
+                # иначе следующий отдельный обрыв молча не даст уведомления.
+                if mgr.is_network_issue_notified(service_id, run_id):
+                    mgr.clear_network_issue_notified(service_id, run_id)
+                    title = status.get("niche_title") or "—"
+                    await bot.send_message(
+                        chat_id,
+                        f"✅ Связь восстановлена, сбор продолжается: <b>{html.escape(str(title))}</b>",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="❌ Закрыть", callback_data="close_message")]
+                        ]),
+                    )
                 # Отложенный старт: пока парсер ждёт своего времени, он пишет
                 # progress_text="ожидание старта в ЧЧ:ММ (...)" (main.py). Как
                 # только это поле сменилось на что-то другое ("старт"/"опрос N")
