@@ -617,14 +617,34 @@ async def _watch(service_id: str, run_id: int, status_file: Path, pid: int, on_u
                 return
 
             if not _is_pid_alive(pid, local_process):
+                # Процесс физически исчез, но это ещё не значит, что он не
+                # успел дописать финальный статус: между этим _read() и
+                # проверкой pid проходит какое-то время, и на практике был
+                # пойман случай, когда write_status("done", ...) на стороне
+                # парсера успевал долететь до диска буквально через доли
+                # секунды ПОСЛЕ того, как мы здесь уже прочитали старую
+                # "running"-версию файла — из-за чего Shinoa рапортовала
+                # "Процесс неожиданно завершился" про на самом деле честно
+                # завершившийся прогон (см. разбор реального инцидента:
+                # status.json содержал корректный "done" с правильными
+                # счётчиками, просто на пару кадров позже этой проверки).
+                # Даём один короткий шанс перечитать файл ещё раз, прежде
+                # чем считать это настоящей аварией.
+                await asyncio.sleep(1.5)
+                retry_data = _read()
+                if retry_data is not None and retry_data.get("status") in ("done", "error"):
+                    if on_update:
+                        await on_update(run_id, retry_data)
+                    return
+
                 # Процесс исчез, не оставив финального статуса — падение,
                 # OOM-killer, или его убили вместе с Shinoa (если Ctrl+C/
                 # systemd всё же дотянулись до него, см. шапку файла).
-                if data is None:
+                if retry_data is None and data is None:
                     data = {"status": "error", "error": "Процесс завершился без итогового статуса"}
-                elif data.get("status") == "running":
-                    data = {**data, "status": "error",
-                            "error": data.get("error") or "Процесс неожиданно завершился"}
+                elif (retry_data or data).get("status") == "running":
+                    data = {**(retry_data or data), "status": "error",
+                            "error": (retry_data or data).get("error") or "Процесс неожиданно завершился"}
                 else:
                     return
                 if on_update:

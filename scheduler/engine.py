@@ -20,6 +20,7 @@ from database.habits import get_all_active_habits
 from scheduler.triggers import make_trigger
 from scheduler.sender import send_reminder, send_yearly_pre_reminder
 from scheduler.digest import send_digest
+from scheduler.needrestart_check import check_needrestart
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,14 @@ class ReminderScheduler:
             CronTrigger(hour=0, minute=5, timezone=self.default_timezone),
             id="refresh_yearly_pre_jobs",
             replace_existing=True,
+        )
+        # Проверка needrestart — раз в сутки, с запасом после окна apt-daily-upgrade (06:00–07:00 +рандом)
+        self.scheduler.add_job(
+            check_needrestart,
+            CronTrigger(hour=7, minute=30, timezone=self.default_timezone),
+            id="needrestart_check",
+            replace_existing=True,
+            kwargs={"bot": self.bot},
         )
 
     # ──────────────────────────────────────────
