@@ -14,6 +14,8 @@ import logging
 from datetime import datetime, date, timedelta
 
 import pytz
+
+from database.tasks import morning_due_date
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -109,10 +111,10 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     tomorrow_tasks = []
 
     for t in morning_tasks:
-        task_date = _get_local_date(t['created_at'], tz)
-        if task_date < today_date:
+        due = morning_due_date(t, tz)
+        if due == today_date:
             today_tasks.append(t)
-        elif task_date == today_date:
+        elif due > today_date:
             tomorrow_tasks.append(t)
 
     # Блок: Сегодняшние задачи (НЕ удаляются и не очищаются в течение дня)
@@ -195,7 +197,7 @@ async def process_expired_morning_tasks(bot: Bot, chat_id: int):
 
     async with get_db() as conn:
         async with conn.execute(
-            "SELECT id, title, text, created_at FROM tasks "
+            "SELECT id, title, text, created_at, due_date FROM tasks "
             "WHERE chat_id = ? AND type = 'morning' AND status = 'active'",
             (chat_id,)
         ) as cur:
@@ -204,10 +206,9 @@ async def process_expired_morning_tasks(bot: Bot, chat_id: int):
         expired_ids = []
         for row in rows:
             task_dict = dict(row)
-            task_date = _get_local_date(task_dict['created_at'], tz)
-
-            # Просрочена = создана РАНЬШЕ вчерашнего дня
-            if task_date < yesterday_date:
+            # Просрочена = её день уже прошел (для старых задач это то же самое,
+            # что «создана раньше вчерашнего дня»)
+            if morning_due_date(task_dict, tz) < today_date:
                 expired_text = f"⏰ <b>Вчерашняя задача не выполнена:</b>\n\n<b>{task_dict['title']}</b>"
                 if task_dict.get('text'):
                     expired_text += f"\n<i>{task_dict['text']}</i>"

@@ -3,12 +3,14 @@ from database.tasks import (
     create_task, get_task, get_tasks, complete_task, delete_task, get_stats,
     get_monthly_morning_tasks,
     get_todays_morning_tasks,
+    morning_due_date,
+    get_pending_dated_morning_schedules,
     CATEGORIES, PRIORITIES, TYPES,
 )
 from database.schedules import (
     add_schedule, get_schedules, deactivate_schedule,
     delete_schedules_for_task, get_all_active_schedules,
-    mark_schedule_fired,
+    mark_schedule_fired, update_schedule_time,
 )
 from database.habits import (
     create_habit, get_habits, get_habit, delete_habit,
@@ -30,10 +32,12 @@ __all__ = [
     "create_task", "get_task", "get_tasks", "complete_task", "delete_task", "get_stats",
     "get_monthly_morning_tasks",
     "get_todays_morning_tasks",
+    "morning_due_date",
+    "get_pending_dated_morning_schedules",
     "CATEGORIES", "PRIORITIES", "TYPES",
     "add_schedule", "get_schedules", "deactivate_schedule",
     "delete_schedules_for_task", "get_all_active_schedules",
-    "mark_schedule_fired",
+    "mark_schedule_fired", "update_schedule_time",
     "create_habit", "get_habits", "get_habit", "delete_habit",
     "log_habit", "get_streak", "get_week_stats", "is_done_today", "get_all_active_habits",
     "HABIT_CATEGORIES",

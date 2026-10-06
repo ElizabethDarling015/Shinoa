@@ -16,7 +16,7 @@ from aiogram import Bot
 
 from config import DEFAULT_TIMEZONE
 from database.connection import run_migrations, backup_database
-from database.schedules import get_all_active_schedules
+from database.schedules import get_all_active_schedules, deactivate_schedule
 from database.habits import get_all_active_habits
 from scheduler.triggers import make_trigger
 from scheduler.sender import send_reminder, send_yearly_pre_reminder
@@ -249,6 +249,36 @@ class ReminderScheduler:
 
         if self.scheduler.get_job(job_id):
             self.scheduler.remove_job(job_id)
+
+    async def reschedule_dated_morning(self, chat_id: int, time_str: str):
+        """
+        Переносит ещё не отправленные напоминания задач «на день»
+        (Сегодня/Завтра) на новое время утренней сводки.
+        Если на новое время сегодняшнее напоминание уже прошло —
+        оно отменяется: задача остаётся в планах на сегодня без напоминания.
+        """
+        from database.tasks import get_pending_dated_morning_schedules
+        from database.schedules import update_schedule_time
+
+        tz = pytz.timezone(self.default_timezone)
+        now = datetime.now(tz)
+        hour, minute = map(int, time_str.split(":"))
+
+        for s in await get_pending_dated_morning_schedules(chat_id):
+            sid = s["id"]
+            due = datetime.strptime(str(s["task_due_date"])[:10], "%Y-%m-%d").date()
+            fire_at = tz.localize(datetime.combine(due, datetime.min.time().replace(hour=hour, minute=minute)))
+
+            self.remove_task_schedule(sid)
+            if fire_at <= now:
+                await deactivate_schedule(sid)
+                logger.info("Задача на день #%s: новое время сводки уже прошло — без напоминания", s["task_id"])
+                continue
+
+            await update_schedule_time(sid, time_str)
+            s["time"] = time_str
+            self._add_task_job(s)
+            logger.info("Задача на день #%s: напоминание перенесено на %s", s["task_id"], time_str)
 
     def remove_all_for_task(self, schedule_ids: list[int]):
         for sid in schedule_ids:

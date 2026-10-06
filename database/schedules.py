@@ -66,7 +66,7 @@ async def get_all_active_schedules() -> list[dict]:
         async with db.execute(
             """
             SELECT s.*, t.chat_id, t.title, t.text, t.type AS task_type, t.priority,
-                   t.created_at AS task_created_at
+                   t.created_at AS task_created_at, t.due_date AS task_due_date
             FROM schedules s
             JOIN tasks t ON t.id = s.task_id
             WHERE s.is_active = 1 AND t.status = 'active'
@@ -83,4 +83,11 @@ async def mark_schedule_fired(schedule_id: int):
             "UPDATE schedules SET last_fired_at = datetime('now') WHERE id = ?",
             (schedule_id,),
         )
+        await db.commit()
+
+
+async def update_schedule_time(schedule_id: int, time: str):
+    """Меняет время срабатывания расписания ('HH:MM')."""
+    async with get_db() as db:
+        await db.execute("UPDATE schedules SET time = ? WHERE id = ?", (time, schedule_id))
         await db.commit()

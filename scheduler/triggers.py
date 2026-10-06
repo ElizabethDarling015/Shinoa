@@ -59,12 +59,20 @@ def make_trigger(schedule: dict, timezone: str = "Europe/Moscow"):
         # Одноразовое: на следующий день ПОСЛЕ СОЗДАНИЯ задачи в заданное время.
         # Раньше дата считалась от «сейчас», и после перезапуска бота задача
         # «на завтра» молча уезжала ещё на день вперёд.
-        base_date = _local_date_from_utc(schedule.get("task_created_at"), tz)
-        if base_date is None:
-            base_date = datetime.now(tz).date()  # только что созданная задача
-        fire_at = tz.localize(
-            datetime.combine(base_date + timedelta(days=1), dtime(hour, minute))
-        )
+        # Новые задачи «на день» хранят конкретный день в due_date
+        # (кнопки «Сегодня»/«Завтра»); у старых он = дата создания + 1.
+        fire_date = None
+        if schedule.get("task_due_date"):
+            try:
+                fire_date = datetime.strptime(str(schedule["task_due_date"])[:10], "%Y-%m-%d").date()
+            except ValueError:
+                fire_date = None
+        if fire_date is None:
+            base_date = _local_date_from_utc(schedule.get("task_created_at"), tz)
+            if base_date is None:
+                base_date = datetime.now(tz).date()  # только что созданная задача
+            fire_date = base_date + timedelta(days=1)
+        fire_at = tz.localize(datetime.combine(fire_date, dtime(hour, minute)))
         return DateTrigger(run_date=fire_at, timezone=tz)
 
     elif task_type == "interval":

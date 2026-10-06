@@ -32,7 +32,7 @@ HELP_TEXT = (
     "<b>Типы задач:</b>\n"
     "• /week — Еженедельное напоминание (по дням недели)\n"
     "• /daily — Каждый день в одно время\n"
-    "• /morning — Один раз, завтра утром, потом удаляется\n"
+    "• /morning — Один раз, на сегодня или завтра, потом удаляется\n"
     "• /monthly — Каждый месяц в определённое число или раз в год\n\n"
     "<b>Фильтры /list:</b>\n"
     "• /list работа — Только задачи категории «работа»\n"
@@ -85,7 +85,7 @@ def get_new_task_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🌅 Планы на завтра", callback_data="task_morning"),
+                InlineKeyboardButton(text="🌅 Планы на день", callback_data="task_morning"),
                 InlineKeyboardButton(text="📅 Ежедневное", callback_data="task_daily"),
             ],
             [
@@ -288,7 +288,7 @@ async def cb_task_morning(call: CallbackQuery, state: FSMContext):
     await state.set_state(NewMorning.text)
 
     text = (
-        "🌅 <b>Задача на завтра утром</b>\n\n"
+        "🌅 <b>Задача на день</b>\n\n"
         "Напишу тебе завтра в нужное время и задача исчезнет.\n\n"
         "Что нужно сделать?"
     )
@@ -302,7 +302,7 @@ async def cb_task_morning(call: CallbackQuery, state: FSMContext):
         if "message is not modified" in str(e).lower():
             pass
         else:
-            logger.warning(f"Не удалось отредактировать сообщение для Планы на завтра: {e}")
+            logger.warning(f"Не удалось отредактировать сообщение для Планы на день: {e}")
             new_msg = await call.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
             container_id = new_msg.message_id
 

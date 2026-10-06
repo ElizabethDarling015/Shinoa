@@ -3,6 +3,10 @@ CRUD-операции для задач (tasks).
 """
 
 import datetime
+from datetime import date, timedelta
+
+import pytz
+
 from database.connection import get_db
 
 CATEGORIES = ["работа", "личное", "финансы", "здоровье"]
@@ -17,14 +21,16 @@ async def create_task(
     task_type: str,
     category: str = "личное",
     priority: str = "medium",
+    due_date: str | None = None,
 ) -> int:
+    """due_date — локальная дата 'YYYY-MM-DD' для задач «на день» (Сегодня/Завтра)."""
     async with get_db() as db:
         cursor = await db.execute(
             """
-            INSERT INTO tasks (chat_id, title, text, type, category, priority)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (chat_id, title, text, type, category, priority, due_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (chat_id, title, text, task_type, category, priority),
+            (chat_id, title, text, task_type, category, priority, due_date),
         )
         await db.commit()
         return cursor.lastrowid
@@ -139,27 +145,67 @@ async def get_monthly_morning_tasks(chat_id: int) -> list[dict]:
             return [dict(row) for row in rows]
 
 
-async def get_todays_morning_tasks(chat_id: int, created_before: str) -> list[dict]:
+async def get_todays_morning_tasks(chat_id: int, created_before: str, today: str) -> list[dict]:
     """
-    Активные morning-задачи, относящиеся к «сегодня»: созданные СТРОГО РАНЬШЕ
-    полуночи сегодняшнего дня по локальному времени пользователя
-    (то есть вчера или ранее — они должны прийти сегодня утром).
+    Активные задачи «на день», относящиеся к сегодняшнему дню.
 
-    created_before — строка 'YYYY-MM-DD HH:MM:SS' в UTC
-    (момент «полночь сегодня по локальному таймзону», конвертированный в UTC).
+    today — сегодняшняя локальная дата 'YYYY-MM-DD'.
+    created_before — 'YYYY-MM-DD HH:MM:SS' в UTC (полночь сегодня по
+    локальному времени, переведённая в UTC).
 
-    Задачи, созданные сегодня (＝ «на завтра»), в выборку НЕ попадают —
-    завтра они появятся здесь автоматически.
+    Новые задачи (с due_date) попадают сюда, если due_date == сегодня —
+    в том числе созданные сегодня кнопкой «Сегодня».
+    Старые задачи (due_date пустой) — по прежнему правилу: созданы раньше
+    сегодняшней полуночи, то есть вчера или ранее.
     """
     query = """
         SELECT * FROM tasks
         WHERE chat_id = ?
           AND status = 'active'
           AND type = 'morning'
-          AND created_at < ?
+          AND (due_date = ? OR (due_date IS NULL AND created_at < ?))
         ORDER BY id DESC
     """
     async with get_db() as db:
-        async with db.execute(query, (chat_id, created_before)) as cur:
+        async with db.execute(query, (chat_id, today, created_before)) as cur:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+
+def morning_due_date(task: dict, tz) -> date:
+    """
+    На какой локальный день приходится задача «на день».
+    Новые задачи хранят его в due_date, у старых — «дата создания + 1».
+    """
+    due = task.get("due_date")
+    if due:
+        try:
+            return datetime.datetime.strptime(str(due)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    try:
+        created = datetime.datetime.strptime(str(task["created_at"])[:19], "%Y-%m-%d %H:%M:%S")
+        return pytz.UTC.localize(created).astimezone(tz).date() + timedelta(days=1)
+    except (KeyError, ValueError):
+        return datetime.datetime.now(tz).date()
+
+
+async def get_pending_dated_morning_schedules(chat_id: int) -> list[dict]:
+    """
+    Ещё не отправленные напоминания новых задач «на день» (с due_date):
+    они привязаны к времени утренней сводки и переносятся при его смене.
+    """
+    query = """
+        SELECT s.*, t.chat_id, t.title, t.text, t.type AS task_type, t.priority,
+               t.created_at AS task_created_at, t.due_date AS task_due_date
+        FROM schedules s
+        JOIN tasks t ON t.id = s.task_id
+        WHERE t.chat_id = ?
+          AND t.type = 'morning'
+          AND t.status = 'active'
+          AND t.due_date IS NOT NULL
+          AND s.is_active = 1
+    """
+    async with get_db() as db:
+        async with db.execute(query, (chat_id,)) as cur:
+            return [dict(r) for r in await cur.fetchall()]

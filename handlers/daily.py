@@ -1,10 +1,14 @@
 """
 /daily  — ежедневное напоминание (повторяется каждый день до удаления)
-/morning — одноразовая задача, которая придёт завтра утром и самоудалится
+/morning — одноразовая задача на сегодня или на завтра; напоминание приходит
+           во время утренней сводки, невыполненная задача удаляется на следующий день
 """
 
 import logging
+from datetime import datetime, timedelta
 from html import escape
+
+import pytz
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -13,6 +17,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 import database as db
+from config import DEFAULT_TIMEZONE
 from handlers.common import (
     remove_keyboard,
     get_nav_buttons,
@@ -565,10 +570,13 @@ def get_morning_start_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_morning_time_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура для этапа ввода времени в /morning."""
+    """Клавиатура выбора дня в /morning: Сегодня / Завтра."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏰ Стандартное (10:00)", callback_data="morning_time:10:00")],
+            [
+                InlineKeyboardButton(text="🌞Сегодня", callback_data="morning_day:today"),
+                InlineKeyboardButton(text="🌚Завтра", callback_data="morning_day:tomorrow"),
+            ],
             *_make_nav_keyboard(),
         ]
     )
@@ -593,33 +601,37 @@ def get_morning_result_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=_make_nav_keyboard())
 
 
+MORNING_HEADER = "🌅 <b>Задача на день</b>\n\n"
+DAY_LABELS = {"today": "сегодня", "tomorrow": "завтра"}
+
+
 def _morning_time_question(task_text: str, error: str | None = None) -> str:
-    text = "🌅 <b>Задача на завтра</b>\n\n"
+    text = MORNING_HEADER
     text += f"<i>Что делаем:</i>\n«{escape(_truncate_for_display(task_text))}»\n\n"
     if error:
         text += f"{error}\n\n"
-    text += (
-        "В какое время завтра напомнить?\n\n"
-        "Вы можете ввести время вручную (например, <code>08:30</code>)\n"
-        "или нажать кнопку «Стандартное» ниже."
-    )
+    text += "В какое время делаем задачу?👁"
     return text
 
 
-def _morning_priority_question(task_text: str, time_str: str) -> str:
+def _morning_priority_question(task_text: str, day: str) -> str:
     return (
-        "🌅 <b>Задача на завтра</b>\n\n"
-        f"<i>Что делаем:</i> «{escape(_truncate_for_display(task_text))}»\n"
-        f"<i>Время напоминания:</i> <b>{escape(time_str)}</b>\n\n"
+        MORNING_HEADER
+        + f"<i>Что делаем:</i> «{escape(_truncate_for_display(task_text))}»\n"
+        f"<i>Когда:</i> <b>{DAY_LABELS.get(day, day)}</b>\n\n"
         "Выберите <b>приоритет</b> напоминания:"
     )
 
 
-def _morning_success_text(task_text: str, time_str: str, priority: str) -> str:
+def _morning_success_text(task_text: str, day: str, reminder: bool, priority: str) -> str:
     priority_label = db.PRIORITIES.get(priority, priority)
+    if reminder:
+        when = f"Напомню {DAY_LABELS.get(day, day)} во время утренней сводки:"
+    else:
+        when = "Задача добавлена в планы на сегодня:"
     return (
         "✅ <b>Запомнила!😌</b>\n\n"
-        f"Напомню завтра в <b>{escape(time_str)}</b>:\n"
+        f"{when}\n"
         f"<i>{escape(_truncate_for_display(task_text))}</i>\n"
         f"🏷 Приоритет: {escape(priority_label)}"
     )
@@ -724,7 +736,7 @@ async def cmd_morning(message: Message, state: FSMContext):
     await state.set_state(NewMorning.text)
 
     bot_msg = await message.answer(
-        "🌅 <b>Задача на завтра</b>\n\n"
+        "🌅 <b>Задача на день</b>\n\n"
         "Напишу тебе завтра в нужное время и задача исчезнет.\n\n"
         "Что нужно сделать?",
         parse_mode="HTML",
@@ -775,11 +787,8 @@ async def morning_text(message: Message, state: FSMContext):
 
 @router.message(NewMorning.time)
 async def morning_time(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Время нужно ввести текстом, например: <code>10:00</code>", parse_mode="HTML")
-        return
-
-    raw_text = message.text.strip()
+    """На шаге выбора дня ждём кнопку; текстом принимаем только отмену."""
+    raw_text = (message.text or "").strip()
 
     if raw_text.lower() in {"❌ отмена", "отмена", "cancel", "/cancel"}:
         await _cancel_morning_flow(message, None, state)
@@ -791,7 +800,6 @@ async def morning_time(message: Message, state: FSMContext):
 
     data = await state.get_data()
     task_text = data.get("text", "")
-
     if not task_text:
         await state.clear()
         await message.answer(
@@ -800,46 +808,22 @@ async def morning_time(message: Message, state: FSMContext):
         )
         return
 
-    t = parse_time(raw_text)
-
-    if not t:
-        await _edit_morning_container(
-            bot=message.bot,
-            chat_id=message.chat.id,
-            state=state,
-            text=_morning_time_question(task_text, "⚠️ Не поняла время. Формат: <code>10:00</code>"),
-            reply_markup=get_morning_time_keyboard(),
-            fallback_message=message,
-        )
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        return
-
-    hour, minute = t
-    time_str = f"{hour:02d}:{minute:02d}"
-
-    await state.update_data(time=time_str)
-    await state.set_state(NewMorning.priority)
-
     await _edit_morning_container(
         bot=message.bot,
         chat_id=message.chat.id,
         state=state,
-        text=_morning_priority_question(task_text, time_str),
-        reply_markup=get_morning_priority_keyboard(),
+        text=_morning_time_question(task_text, "⚠️ Выбери кнопкой: «Сегодня» или «Завтра»."),
+        reply_markup=get_morning_time_keyboard(),
         fallback_message=message,
     )
-
     try:
         await message.delete()
     except Exception:
         pass
 
 
-@router.callback_query(F.data == "morning_time:10:00")
-async def cb_morning_time_standard(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("morning_day:"))
+async def cb_morning_day(call: CallbackQuery, state: FSMContext):
     if not call.message:
         await call.answer("Сообщение было удалено. Начни заново через /morning", show_alert=True)
         await state.clear()
@@ -853,10 +837,14 @@ async def cb_morning_time_standard(call: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
+    day = call.data.split(":", 1)[1]
+    if day not in DAY_LABELS:
+        await call.answer()
+        return
+
     await call.answer()
 
-    time_str = "10:00"
-    await state.update_data(time=time_str)
+    await state.update_data(day=day)
     await state.set_state(NewMorning.priority)
 
     container_id = await _get_morning_container_id(state)
@@ -867,7 +855,7 @@ async def cb_morning_time_standard(call: CallbackQuery, state: FSMContext):
         bot=call.bot,
         chat_id=call.message.chat.id,
         state=state,
-        text=_morning_priority_question(task_text, time_str),
+        text=_morning_priority_question(task_text, day),
         reply_markup=get_morning_priority_keyboard(),
         fallback_message=call.message,
     )
@@ -908,50 +896,69 @@ async def cb_morning_priority(call: CallbackQuery, state: FSMContext):
 
     data = await state.get_data()
     task_text = data.get("text")
-    time_str = data.get("time")
+    day = data.get("day")
 
-    if not task_text or not time_str:
+    if not task_text or day not in DAY_LABELS:
         await call.answer("Данные потерялись. Начни заново через /morning", show_alert=True)
         await state.clear()
         return
 
     priority = call.data.split(":", 1)[1]
-    title = task_text
+    chat_id = call.message.chat.id
+
+    # День задачи и время напоминания (= время утренней сводки из настроек)
+    tz = pytz.timezone(DEFAULT_TIMEZONE)
+    now = datetime.now(tz)
+    due = now.date() if day == "today" else now.date() + timedelta(days=1)
+
+    user = await db.get_user(chat_id)
+    time_str = (user or {}).get("digest_time") or "07:00"
+    try:
+        hour, minute = map(int, time_str.split(":"))
+    except ValueError:
+        time_str, hour, minute = "07:00", 7, 0
+    fire_at = tz.localize(datetime.combine(due, datetime.min.time().replace(hour=hour, minute=minute)))
+
+    # «Сегодня», а сводка уже прошла — без напоминания, задача только в планах
+    reminder = fire_at > now
 
     task_id = await db.create_task(
-        chat_id=call.message.chat.id,
-        title=title,
+        chat_id=chat_id,
+        title=task_text,
         text=task_text,
         task_type="morning",
         category="личное",
         priority=priority,
+        due_date=due.isoformat(),
     )
 
-    schedule_id = await db.add_schedule(
-        task_id=task_id,
-        time=time_str,
-        one_shot=True,
-    )
+    if reminder:
+        schedule_id = await db.add_schedule(
+            task_id=task_id,
+            time=time_str,
+            one_shot=True,
+        )
 
-    if _scheduler:
-        schedule = {
-            "id": schedule_id,
-            "task_id": task_id,
-            "time": time_str,
-            "task_type": "morning",
-            "chat_id": call.message.chat.id,
-            "title": "🌅 Задача на завтра",
-            "text": task_text,
-            "priority": priority,
-            "one_shot": True,
-        }
-        _scheduler.add_task_schedule(schedule)
+        if _scheduler:
+            schedule = {
+                "id": schedule_id,
+                "task_id": task_id,
+                "time": time_str,
+                "task_type": "morning",
+                "task_due_date": due.isoformat(),
+                "chat_id": chat_id,
+                "title": task_text,
+                "text": task_text,
+                "priority": priority,
+                "one_shot": True,
+            }
+            _scheduler.add_task_schedule(schedule)
 
     container_id = await _get_morning_container_id(state) or call.message.message_id
 
     await state.clear()
 
-    success_text = _morning_success_text(task_text, time_str, priority)
+    success_text = _morning_success_text(task_text, day, reminder, priority)
     success_kb = get_morning_result_keyboard()
 
     try:

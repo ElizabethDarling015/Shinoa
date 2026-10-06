@@ -26,6 +26,13 @@ from handlers.common import parse_time, remove_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+_scheduler = None
+
+
+def set_scheduler(scheduler):
+    global _scheduler
+    _scheduler = scheduler
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -301,6 +308,13 @@ async def step_digest_time(message: Message, state: FSMContext):
 
     await set_digest_time(message.chat.id, time_str)
     await state.clear()
+
+    # Напоминания задач «на день» привязаны ко времени сводки — переносим их
+    if _scheduler:
+        try:
+            await _scheduler.reschedule_dated_morning(message.chat.id, time_str)
+        except Exception as e:
+            logger.error("Не удалось перенести напоминания задач на день: %s", e)
 
     success_text = (
         f"✅ Утренняя сводка будет приходить в <b>{time_str}</b>.\n\n"

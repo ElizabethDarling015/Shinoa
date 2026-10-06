@@ -46,12 +46,18 @@ PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 last_list_messages = {}
 
 
-def get_list_nav_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура навигации для списка задач"""
+def get_list_nav_keyboard(back_to_menu: bool = False) -> InlineKeyboardMarkup:
+    """Клавиатура навигации для списка задач.
+    back_to_menu=True — «Назад» ведёт в меню задач (для списка по приоритету),
+    иначе — к выбору категорий (для списка конкретной категории)."""
+    if back_to_menu:
+        back = InlineKeyboardButton(text="⬅️ Назад в меню задач", callback_data="start_list")
+    else:
+        back = InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="tasks_menu:categories")
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="tasks_menu:categories"),
+                back,
                 InlineKeyboardButton(text="🏠 На главную", callback_data="start_main"),
             ]
         ]
@@ -128,10 +134,11 @@ async def cb_tasks_today(call: CallbackQuery):
     midnight_utc = midnight_local.astimezone(pytz.UTC)
     created_before = midnight_utc.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Получаем только morning-задачи, созданные ДО сегодняшней локальной полуночи
+    # Задачи на сегодня: новые — по due_date, старые — созданные до полуночи
     tasks = await db.get_todays_morning_tasks(
         call.message.chat.id,
         created_before=created_before,
+        today=now_local.date().isoformat(),
     )
 
     if not tasks:
@@ -228,7 +235,7 @@ async def cb_tasks_categories(call: CallbackQuery):
 async def cb_tasks_priority(call: CallbackQuery):
     """Показывает все задачи по приоритетам, редактируя текущее сообщение"""
     await call.answer()
-    await send_task_list(call.message, exclude_type="morning", edit=True)
+    await send_task_list(call.message, exclude_type="morning", edit=True, back_to_menu=True)
 
 
 # ──────────────────────────────────────────────────────────
@@ -309,12 +316,8 @@ async def _build_list_text(chat_id: int, category: str = None, priority: str = N
     if not tasks:
         filter_note = f" по фильтру «{category or priority}»" if (category or priority) else ""
         return (
-            f"У вас нет активных задач{filter_note}.🙄\n\n"
-            "Создать:\n"
-            "/week — еженедельное\n"
-            "/monthly — ежемесячное\n"
-            "/daily — ежедневное\n"
-            "/morning — задача на завтра"
+            f"<b>У вас нет активных задач{filter_note}.🙄</b>\n\n"
+            "🤔 Нужно срочно придумать чем заняться!🍧"
         )
 
     tasks_by_priority = {"high": [], "medium": [], "low": []}
@@ -375,12 +378,13 @@ async def send_task_list(
     exclude_type: str = None,
     use_close_keyboard: bool = False,
     edit: bool = False,
+    back_to_menu: bool = False,
 ):
     """Основная логика показа списка задач.
     edit=True — редактирует текущее сообщение (для inline-кнопок),
     иначе отправляет новое (для команд типа /list)."""
     text = await _build_list_text(message.chat.id, category, priority, exclude_type)
-    keyboard = get_close_keyboard() if use_close_keyboard else get_list_nav_keyboard()
+    keyboard = get_close_keyboard() if use_close_keyboard else get_list_nav_keyboard(back_to_menu)
 
     if edit:
         try:

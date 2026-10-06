@@ -34,3 +34,4 @@ def set_scheduler(scheduler):
     list_tasks.set_scheduler(scheduler)
     snooze.set_scheduler(scheduler)
     habits.set_scheduler(scheduler)
+    settings.set_scheduler(scheduler)
