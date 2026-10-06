@@ -9,7 +9,11 @@ from html import escape
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from database.schedules import deactivate_schedule
+import pytz
+
+from config import DEFAULT_TIMEZONE
+from database.tasks import get_task
+from database.schedules import deactivate_schedule, mark_schedule_fired
 
 logger = logging.getLogger(__name__)
 
@@ -52,17 +56,34 @@ async def send_reminder(
     text: str,
     priority: str = "medium",
     one_shot: bool = False,
+    missed_at: str | None = None,
 ):
-    """Отправляет напоминание с кнопками. Для one_shot деактивирует расписание."""
-    now = datetime.now().strftime("%H:%M")
+    """
+    Отправляет напоминание с кнопками. Для one_shot деактивирует расписание.
+
+    missed_at — если задано (строка вида "06.10 10:00"), это догоняющая
+    отправка пропущенного срабатывания: в сообщение добавляется пометка.
+    """
+    # Защита: не напоминать о задаче, которую уже выполнили или удалили.
+    # (Например, отложенное «через неделю» напоминание переживает удаление
+    # задачи, пока бот не перезапущен.)
+    task = await get_task(task_id)
+    if not task or task.get("status") != "active":
+        logger.info("Пропуск напоминания: задача %s неактивна или удалена", task_id)
+        return
+
+    now = datetime.now(pytz.timezone(DEFAULT_TIMEZONE)).strftime("%H:%M")
     p_emoji = PRIORITY_EMOJI.get(priority, "🟡")
 
     body = ""
     if text and str(text).strip() != (title or "").strip():
         body = f"\n\n{escape(str(text))}"
+    missed_note = ""
+    if missed_at:
+        missed_note = f"\n⚠️ <i>Пропущено, пока бот был выключен (должно было прийти {missed_at})</i>"
     msg = (
         f"🔔 {p_emoji} <b>{escape(title)}</b>{body}\n\n"
-        f"<i>{now}</i>"
+        f"<i>{now}</i>{missed_note}"
     )
 
     try:
@@ -71,7 +92,15 @@ async def send_reminder(
             parse_mode="HTML",
             reply_markup=task_keyboard(task_id, schedule_id),
         )
-        logger.info("Напоминание отправлено → чат %s: %s", chat_id, title)
+        logger.info(
+            "Напоминание отправлено%s → чат %s: %s",
+            " (догоняющее)" if missed_at else "", chat_id, title,
+        )
+
+        try:
+            await mark_schedule_fired(schedule_id)
+        except Exception as e:
+            logger.warning("Не удалось записать last_fired_at для %s: %s", schedule_id, e)
 
         if one_shot:
             await deactivate_schedule(schedule_id)

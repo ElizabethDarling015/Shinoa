@@ -7,6 +7,7 @@
 import logging
 import pytz
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -19,6 +20,7 @@ from database.schedules import get_all_active_schedules
 from database.habits import get_all_active_habits
 from scheduler.triggers import make_trigger
 from scheduler.sender import send_reminder, send_yearly_pre_reminder
+from scheduler.catchup import find_missed
 from scheduler.digest import send_digest
 from scheduler.needrestart_check import check_needrestart
 
@@ -30,7 +32,17 @@ class ReminderScheduler:
     def __init__(self, bot: Bot, default_timezone: str = DEFAULT_TIMEZONE):
         self.bot = bot
         self.default_timezone = default_timezone
-        self.scheduler = AsyncIOScheduler(timezone=default_timezone)
+        self.scheduler = AsyncIOScheduler(
+            timezone=default_timezone,
+            job_defaults={
+                # Если срабатывание опоздало (VM подвисла, ноутбук/хост
+                # просыпался и т.п.) — всё равно выполнить, если опоздание
+                # не больше 5 минут. По умолчанию APScheduler даёт 1 секунду.
+                "misfire_grace_time": 300,
+                # Несколько пропущенных подряд срабатываний — выполнить один раз.
+                "coalesce": True,
+            },
+        )
 
     # ──────────────────────────────────────────
     # Жизненный цикл
@@ -43,9 +55,54 @@ class ReminderScheduler:
         self._schedule_jobs()
         self.scheduler.start()
         logger.info("Планировщик запущен")
+        await self._backup_if_missed()
+        await self._catch_up_missed()
 
     async def stop(self):
         self.scheduler.shutdown(wait=False)
+
+    # ──────────────────────────────────────────
+    # Догоняние того, что пропущено, пока бот был выключен
+    # ──────────────────────────────────────────
+
+    async def _catch_up_missed(self):
+        """Отправляет напоминания, срабатывание которых пришлось на время простоя."""
+        try:
+            schedules = await get_all_active_schedules()
+            missed = find_missed(schedules, self.default_timezone)
+        except Exception as e:
+            logger.error("Догоняние: не удалось проверить пропуски: %s", e)
+            return
+
+        if not missed:
+            logger.info("Догоняние: пропущенных напоминаний нет")
+            return
+
+        for s, occurrence in missed:
+            logger.info(
+                "Догоняние: расписание %s («%s») пропущено в %s",
+                s["id"], s["title"], occurrence.strftime("%d.%m.%Y %H:%M"),
+            )
+            await send_reminder(
+                bot=self.bot,
+                chat_id=s["chat_id"],
+                task_id=s["task_id"],
+                schedule_id=s["id"],
+                title=s["title"],
+                text=s["text"],
+                priority=s.get("priority", "medium"),
+                one_shot=bool(s.get("one_shot")),
+                missed_at=occurrence.strftime("%d.%m %H:%M"),
+            )
+
+    async def _backup_if_missed(self):
+        """Если ночной бэкап за сегодня не сделан (бот был выключен в 03:00) — делаем сейчас."""
+        try:
+            today = datetime.now(pytz.timezone(self.default_timezone)).date()
+            if not (Path("backups") / f"daily_{today}.db").exists():
+                await backup_database()
+        except Exception as e:
+            logger.error("Не удалось сделать догоняющий бэкап: %s", e)
 
     # ──────────────────────────────────────────
     # Загрузка из БД при старте
@@ -142,6 +199,14 @@ class ReminderScheduler:
 
     def _add_task_job(self, schedule: dict):
         trigger = make_trigger(schedule, self.default_timezone)
+
+        # Разовое срабатывание («на завтра»), время которого уже прошло, в
+        # планировщик не ставим — его отправит догоняние (_catch_up_missed),
+        # иначе получился бы дубль.
+        if isinstance(trigger, DateTrigger):
+            now = datetime.now(pytz.timezone(self.default_timezone))
+            if trigger.run_date <= now:
+                return
 
         self.scheduler.add_job(
             send_reminder,

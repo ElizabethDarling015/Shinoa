@@ -8,6 +8,7 @@ from database.tasks import (
 from database.schedules import (
     add_schedule, get_schedules, deactivate_schedule,
     delete_schedules_for_task, get_all_active_schedules,
+    mark_schedule_fired,
 )
 from database.habits import (
     create_habit, get_habits, get_habit, delete_habit,
@@ -32,6 +33,7 @@ __all__ = [
     "CATEGORIES", "PRIORITIES", "TYPES",
     "add_schedule", "get_schedules", "deactivate_schedule",
     "delete_schedules_for_task", "get_all_active_schedules",
+    "mark_schedule_fired",
     "create_habit", "get_habits", "get_habit", "delete_habit",
     "log_habit", "get_streak", "get_week_stats", "is_done_today", "get_all_active_habits",
     "HABIT_CATEGORIES",

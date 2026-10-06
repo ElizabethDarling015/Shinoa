@@ -6,7 +6,7 @@ import pytz
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 
 def make_trigger(schedule: dict, timezone: str = "Europe/Moscow"):
@@ -56,10 +56,14 @@ def make_trigger(schedule: dict, timezone: str = "Europe/Moscow"):
         )
 
     elif task_type == "morning":
-        # Одноразовое: завтра в заданное время
-        now = datetime.now(tz)
-        fire_at = (now + timedelta(days=1)).replace(
-            hour=hour, minute=minute, second=0, microsecond=0
+        # Одноразовое: на следующий день ПОСЛЕ СОЗДАНИЯ задачи в заданное время.
+        # Раньше дата считалась от «сейчас», и после перезапуска бота задача
+        # «на завтра» молча уезжала ещё на день вперёд.
+        base_date = _local_date_from_utc(schedule.get("task_created_at"), tz)
+        if base_date is None:
+            base_date = datetime.now(tz).date()  # только что созданная задача
+        fire_at = tz.localize(
+            datetime.combine(base_date + timedelta(days=1), dtime(hour, minute))
         )
         return DateTrigger(run_date=fire_at, timezone=tz)
 
@@ -83,3 +87,14 @@ def _convert_days(days_str: str | None) -> str | None:
         return ",".join(ap_map[n] for n in nums if n in ap_map)
     except (ValueError, KeyError):
         return days_str
+
+
+def _local_date_from_utc(created_at: str | None, tz):
+    """'YYYY-MM-DD HH:MM:SS' в UTC (как пишет SQLite datetime('now')) → локальная дата."""
+    if not created_at:
+        return None
+    try:
+        dt = datetime.strptime(str(created_at)[:19], "%Y-%m-%d %H:%M:%S")
+        return pytz.UTC.localize(dt).astimezone(tz).date()
+    except ValueError:
+        return None
