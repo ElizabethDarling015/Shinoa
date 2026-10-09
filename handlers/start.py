@@ -73,8 +73,8 @@ def get_start_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🗂 Архив идей", callback_data="start_idea"),
             ],
             [
-                InlineKeyboardButton(text="⚙️ Настройки", callback_data="start_settings"),
                 InlineKeyboardButton(text="📖 Справка", callback_data="start_help"),
+                InlineKeyboardButton(text="⚙️ Настройки", callback_data="start_settings"),
             ],
         ]
     )

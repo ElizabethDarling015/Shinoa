@@ -58,8 +58,8 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔄 Обновиться", callback_data="system_update"),
         ],
         [
-            InlineKeyboardButton(text="❌ Закрыть", callback_data="settings_close"),
             InlineKeyboardButton(text="🌐 Прокси", callback_data="px:menu"),  # было: ➖ / system_stub
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="settings_close"),
         ],
         [
             InlineKeyboardButton(text="🏠 В главное меню", callback_data="start_main"),
