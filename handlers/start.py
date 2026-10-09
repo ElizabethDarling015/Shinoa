@@ -580,13 +580,21 @@ async def cb_digest_now(call: CallbackQuery):
 
     try:
         from database.users import get_user
-        from scheduler.digest import build_digest_text
+        from scheduler.digest import build_digest_parts
 
         user = await get_user(call.message.chat.id)
         city = user["city"] if user and user.get("city") else None
 
-        text = await build_digest_text(call.message.chat.id, city=city)
-        await show(text, _get_digest_keyboard())
+        parts = await build_digest_parts(call.message.chat.id, city=city)
+        if len(parts) == 1:
+            await show(parts[0], _get_digest_keyboard())
+        else:
+            # Длинная сводка: первая часть — в этом же сообщении,
+            # продолжение — новыми сообщениями, кнопки — под последним
+            await show(parts[0])
+            for i, extra in enumerate(parts[1:], start=1):
+                kb = _get_digest_keyboard() if i == len(parts) - 1 else None
+                await call.message.answer(extra, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.exception("Ошибка при сборке сводки: %s", e)
         await show(

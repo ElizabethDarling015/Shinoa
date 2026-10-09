@@ -7,6 +7,35 @@ from aiogram.types import (
 )
 from database.tasks import CATEGORIES, PRIORITIES
 
+import logging
+
+_logger = logging.getLogger(__name__)
+
+# Текст, на который заменяется сообщение бота, если его уже нельзя удалить
+# (Telegram не даёт удалять сообщения старше 48 часов).
+DELETED_STUB_TEXT = "🤷‍♀️ <i>Тут что-то было...</i>🙄"
+
+
+async def delete_or_stub(message) -> None:
+    """
+    Удаляет сообщение бота. Если удалить нельзя (старше 48 часов),
+    заменяет его текст на заглушку «Тут что-то было...» и убирает кнопки.
+    """
+    try:
+        await message.delete()
+        return
+    except Exception as e:
+        _logger.info("Не удалось удалить сообщение %s, ставлю заглушку: %s",
+                     getattr(message, "message_id", "?"), e)
+    try:
+        await message.edit_text(DELETED_STUB_TEXT, parse_mode="HTML", reply_markup=None)
+    except Exception:
+        # Например, у сообщения с фото/файлом нет текста — хотя бы снимаем кнопки
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
 # ──────────────────────────────────────────────
 # Inline клавиатуры (для нового /week и меню)
 # ──────────────────────────────────────────────

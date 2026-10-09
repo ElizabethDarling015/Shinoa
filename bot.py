@@ -251,17 +251,8 @@ goodbye_router = Router(name="goodbye_router")
 @goodbye_router.callback_query(F.data == "goodbye_close")
 async def cb_goodbye_close(call: CallbackQuery):
     """Кнопка 'До завтра 🌙' — удаляет прощальное сообщение."""
-    try:
-        await call.message.delete()
-    except TelegramBadRequest as e:
-        # Если прошло >48 часов — Telegram запрещает удаление, снимаем только клавиатуру
-        logger.warning("Не удалось удалить прощальное сообщение: %s", e)
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-    except Exception as e:
-        logger.warning("Не удалось удалить прощальное сообщение: %s", e)
+    from handlers.common import delete_or_stub
+    await delete_or_stub(call.message)
 
     try:
         await call.answer()

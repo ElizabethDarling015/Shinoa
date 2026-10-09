@@ -33,6 +33,18 @@ def task_keyboard(task_id: int, schedule_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def morning_task_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    """Кнопки под напоминанием задачи «на день»: после любой сообщение исчезает.
+    Обрабатываются тем же хендлером, что и «Сегодня в планах» (task_act:*)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Выполнено", callback_data=f"task_act:done:{task_id}"),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data=f"task_act:hide:{task_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"task_act:del:{task_id}"),
+        ],
+    ])
+
+
 def snooze_keyboard(task_id: int, schedule_id: int) -> InlineKeyboardMarkup:
     """Кнопки выбора времени откладывания."""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -90,7 +102,11 @@ async def send_reminder(
         await bot.send_message(
             chat_id, msg,
             parse_mode="HTML",
-            reply_markup=task_keyboard(task_id, schedule_id),
+            reply_markup=(
+                morning_task_keyboard(task_id)
+                if task.get("type") == "morning"
+                else task_keyboard(task_id, schedule_id)
+            ),
         )
         logger.info(
             "Напоминание отправлено%s → чат %s: %s",

@@ -14,6 +14,7 @@ import database as db
 from config import DEFAULT_TIMEZONE
 from apscheduler.triggers.date import DateTrigger
 from scheduler.sender import snooze_keyboard
+from handlers.common import delete_or_stub
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -69,16 +70,8 @@ async def cb_done(call: CallbackQuery):
         if _scheduler:
             _scheduler.remove_all_for_task([s["id"] for s in schedules])
 
-    # Удаляем сообщение напоминания из чата
-    try:
-        await call.message.delete()
-    except Exception as e:
-        logger.warning("Не удалось удалить сообщение напоминания: %s", e)
-        # Фолбэк: если удалить нельзя (сообщение старше 48ч) — оставляем короткую пометку
-        try:
-            await call.message.edit_text("✅ <b>Выполнено!</b>", parse_mode="HTML", reply_markup=None)
-        except Exception:
-            pass
+    # Удаляем сообщение напоминания из чата (старше 48ч — заглушка)
+    await delete_or_stub(call.message)
 
     await call.answer("Отлично! Задача выполнена 💪")
 
@@ -171,11 +164,15 @@ async def cb_delete_task(call: CallbackQuery):
     if _scheduler:
         _scheduler.remove_all_for_task(schedule_ids)
 
-    await call.message.edit_text(
-        call.message.text + "\n\n🗑 <i>Задача удалена.</i>",
-        parse_mode="HTML",
-        reply_markup=None,
-    )
+    if task["type"] == "morning":
+        # Задачи «на день»: сообщение просто исчезает
+        await delete_or_stub(call.message)
+    else:
+        await call.message.edit_text(
+            call.message.text + "\n\n🗑 <i>Задача удалена.</i>",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
     await call.answer("Задача удалена.")
 
 # ──────────────────────────────────────────────────────────

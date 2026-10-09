@@ -766,10 +766,8 @@ async def cb_svc_close(call: CallbackQuery):
     это два независимых места хранения, удаление сообщения никогда не трогает исходник."""
     await call.answer()
     _clear_view(call.message.chat.id, call.message.message_id)
-    try:
-        await call.message.delete()
-    except TelegramBadRequest:
-        pass
+    from handlers.common import delete_or_stub
+    await delete_or_stub(call.message)
 
 
 @router.callback_query(F.data.startswith("svc_logs:"))

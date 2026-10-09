@@ -19,6 +19,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 import database as db
 from config import DEFAULT_TIMEZONE
 from handlers.common import (
+    delete_or_stub,
     remove_keyboard,
     get_nav_buttons,
     get_daily_category_inline,
@@ -876,13 +877,7 @@ async def cb_close_morning(call: CallbackQuery):
     где кнопка «Закрыть» ещё могла остаться.
     """
     if call.message:
-        try:
-            await call.message.delete()
-        except Exception:
-            try:
-                await call.message.edit_text("❌ Закрыто.")
-            except Exception:
-                pass
+        await delete_or_stub(call.message)
 
     await call.answer("Закрыто")
 

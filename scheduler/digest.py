@@ -11,6 +11,7 @@
 """
 
 import logging
+import re
 from datetime import datetime, date, timedelta
 
 import pytz
@@ -23,7 +24,7 @@ from config import DEFAULT_TIMEZONE, WEATHER_API_KEY, HOST_IP_URL
 from services.weather import get_weather
 from database.connection import get_db
 
-from html import escape
+from html import escape, unescape
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,20 @@ async def get_home_ip() -> str | None:
 
 
 async def build_digest_text(chat_id: int, city: str = None) -> str:
+    """Собирает текст утренней сводки одной строкой (без учёта лимита Telegram)."""
+    return "\n".join(await _build_digest_blocks(chat_id, city))
+
+
+async def build_digest_parts(chat_id: int, city: str = None) -> list[str]:
+    """Сводка, разбитая на части, каждая из которых влезает в одно сообщение."""
+    return split_into_messages(await _build_digest_blocks(chat_id, city))
+
+
+async def _build_digest_blocks(chat_id: int, city: str = None) -> list[str]:
     """
-    Собирает текст утренней сводки.
+    Собирает сводку как список блоков. Каждый блок — законченный кусок HTML
+    (теги не переходят из блока в блок), поэтому между блоками сводку
+    можно безопасно резать на несколько сообщений.
     """
     from database.tasks import get_tasks
     from database.habits import get_habits, is_done_today
@@ -120,20 +133,16 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     # Блок: Сегодняшние задачи (НЕ удаляются и не очищаются в течение дня)
     lines.append("\n<b>🌅 Сегодняшние задачи:</b>")
     if today_tasks:
-        for task in today_tasks[:10]:
+        for task in today_tasks:
             lines.append(_full_task_line(task))
-        if len(today_tasks) > 10:
-            lines.append(f"  <i>...и ещё {len(today_tasks) - 10}</i>")
     else:
         lines.append("  <i>На сегодня задач нет🙄</i>")
 
     # Блок: Завтрашние задачи
     if tomorrow_tasks:
         lines.append("\n<b>🌙 Завтрашние задачи:</b>")
-        for task in tomorrow_tasks[:10]:
+        for task in tomorrow_tasks:
             lines.append(_full_task_line(task))
-        if len(tomorrow_tasks) > 10:
-            lines.append(f"  <i>...и ещё {len(tomorrow_tasks) - 10}</i>")
 
     # ── Привычки
     habits = await get_habits(chat_id)
@@ -150,7 +159,82 @@ async def build_digest_text(chat_id: int, city: str = None) -> str:
     # ── Подсказка
     lines.append("\n<i>Хорошего дня! 🚀</i>")
 
-    return "\n".join(lines)
+    return lines
+
+
+# ──────────────────────────────────────────────
+# Разбиение длинной сводки на несколько сообщений
+# ──────────────────────────────────────────────
+
+# Лимит Telegram — 4096 символов текста (теги HTML не считаются).
+# Берём с запасом: эмодзи Telegram может считать за 2 символа,
+# плюс место под заголовок «Продолжение сводки (2/3)».
+MESSAGE_LIMIT = 3900
+
+
+def _visible_len(html_text: str) -> int:
+    """Длина текста так, как его посчитает Telegram: без тегов, в UTF-16."""
+    plain = unescape(re.sub(r"<[^>]+>", "", html_text))
+    return len(plain.encode("utf-16-le")) // 2
+
+
+def _split_oversized_block(block: str, limit: int) -> list[str]:
+    """Один блок длиннее лимита (огромное описание задачи) — режем по словам,
+    без форматирования, чтобы не разорвать HTML-теги."""
+    plain = unescape(re.sub(r"<[^>]+>", "", block))
+    chunks, current = [], ""
+    for word in plain.split(" "):
+        candidate = f"{current} {word}" if current else word
+        if _visible_len(escape(candidate)) > limit and current:
+            chunks.append(escape(current))
+            current = word
+        else:
+            current = candidate
+    if current:
+        chunks.append(escape(current))
+    # Слово без пробелов длиннее лимита — режем жёстко
+    result = []
+    for c in chunks:
+        while _visible_len(c) > limit:
+            raw = unescape(c)
+            result.append(escape(raw[: limit // 2]))
+            c = escape(raw[limit // 2:])
+        result.append(c)
+    return result
+
+
+def split_into_messages(blocks: list[str], limit: int = MESSAGE_LIMIT) -> list[str]:
+    """
+    Упаковывает блоки в сообщения не длиннее limit, разрезая только
+    между блоками (задача никогда не рвётся посередине, если влезает целиком).
+    Начиная со второго сообщения добавляется заголовок «Продолжение сводки (N/M)».
+    """
+    limit -= 60  # место под заголовок «Продолжение сводки (N/M)»
+    pieces = []
+    for b in blocks:
+        if _visible_len(b) > limit:
+            pieces.extend(_split_oversized_block(b, limit))
+        else:
+            pieces.append(b)
+
+    messages, current = [], []
+    for p in pieces:
+        candidate = "\n".join(current + [p])
+        if current and _visible_len(candidate) > limit:
+            messages.append("\n".join(current))
+            current = [p.lstrip("\n")]
+        else:
+            current.append(p)
+    if current:
+        messages.append("\n".join(current))
+
+    total = len(messages)
+    if total > 1:
+        messages = [messages[0]] + [
+            f"📋 <b>Продолжение сводки ({i}/{total})</b>\n\n{m}"
+            for i, m in enumerate(messages[1:], start=2)
+        ]
+    return messages
 
 
 # ──────────────────────────────────────────────
@@ -242,12 +326,14 @@ async def send_digest(bot: Bot, chat_id: int, city: str = None):
     # 1. СНАЧАЛА очищаем просроченные (позавчерашние и старее) задачи
     await process_expired_morning_tasks(bot, chat_id)
 
-    # 2. ЗАТЕМ собираем и отправляем саму сводку
-    text = await build_digest_text(chat_id, city)
+    # 2. ЗАТЕМ собираем и отправляем саму сводку (если длинная — несколькими сообщениями)
+    parts = await build_digest_parts(chat_id, city)
 
     try:
-        msg = await bot.send_message(chat_id, text, parse_mode="HTML")
-        logger.info("Утренняя сводка отправлена → чат %s", chat_id)
+        msg = await bot.send_message(chat_id, parts[0], parse_mode="HTML")
+        for extra in parts[1:]:
+            await bot.send_message(chat_id, extra, parse_mode="HTML")
+        logger.info("Утренняя сводка отправлена → чат %s (сообщений: %d)", chat_id, len(parts))
     except Exception as e:
         logger.error("Ошибка отправки сводки → чат %s: %s", chat_id, e)
         return
@@ -267,7 +353,7 @@ async def send_digest(bot: Bot, chat_id: int, city: str = None):
         )
         logger.info("Сводка закреплена → чат %s", chat_id)
     except Exception as e:
-        logger.warning("Не удалось закрепить сводку: %s", chat_id, e)
+        logger.warning("Не удалось закрепить сводку → чат %s: %s", chat_id, e)
 
 
 async def send_all_digests(bot: Bot):

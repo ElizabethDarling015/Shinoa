@@ -22,7 +22,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.exceptions import TelegramBadRequest
 
 from database.users import get_user, set_city, set_digest_time, upsert_user
-from handlers.common import parse_time, remove_keyboard
+from handlers.common import parse_time, remove_keyboard, delete_or_stub
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -108,14 +108,7 @@ async def _edit_settings_msg(
 @router.callback_query(F.data == "settings_close")
 async def cb_settings_close(call: CallbackQuery):
     """Удаляет текущее сообщение настроек"""
-    try:
-        await call.message.delete()
-    except TelegramBadRequest as e:
-        logger.warning("Не удалось удалить сообщение: %s", e)
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+    await delete_or_stub(call.message)
     await call.answer()
 
 

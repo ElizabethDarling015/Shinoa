@@ -15,7 +15,7 @@ from html import escape
 
 import database as db
 from config import DEFAULT_TIMEZONE
-from handlers.common import WEEKDAY_LABELS
+from handlers.common import WEEKDAY_LABELS, delete_or_stub
 
 logger = logging.getLogger(__name__)
 
@@ -170,10 +170,7 @@ async def cb_task_action(call: CallbackQuery):
 
     if action == "hide":
         await call.answer()
-        try:
-            await call.message.delete()
-        except Exception as e:
-            logger.warning(f"Не удалось скрыть сообщение: {e}")
+        await delete_or_stub(call.message)
 
     elif action == "del":
         task = await db.get_task(task_id)
@@ -184,10 +181,7 @@ async def cb_task_action(call: CallbackQuery):
                 _scheduler.remove_all_for_task(schedule_ids)
 
         await call.answer("🗑 Задача удалена навсегда!", show_alert=True)
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
+        await delete_or_stub(call.message)
 
     elif action == "done":
         task = await db.get_task(task_id)
@@ -209,10 +203,7 @@ async def cb_task_action(call: CallbackQuery):
                 _scheduler.remove_all_for_task(schedule_ids)
 
         await call.answer("✅ Задача выполнена и перенесена в архив!", show_alert=True)
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
+        await delete_or_stub(call.message)
 
 
 @router.callback_query(F.data == "tasks_menu:categories")
@@ -502,10 +493,7 @@ async def cb_list_all(call: CallbackQuery):
 async def cb_close_message(call: CallbackQuery):
     """Удаляет сообщение при нажатии кнопки 'Закрыть'"""
     await call.answer()
-    try:
-        await call.message.delete()
-    except Exception as e:
-        logger.warning(f"Не удалось удалить сообщение: {e}")
+    await delete_or_stub(call.message)
 
 
 # Команды для проверки (Тест-план)
