@@ -261,10 +261,14 @@ async def format_task(task: dict) -> str:
     if text and text != (task.get("title") or "").strip():
         text_block = f"\n📋 {escape(text)}"
 
+    # У задач «на день» нет своего расписания: они привязаны ко времени
+    # утренней сводки, поэтому строку 🕐 для них не показываем
+    sched_part = "" if task["type"] == "morning" else f"\n🕐{sched_text}"
+
     return (
         f"{p} <b>{escape(task['title'])}</b> <code>[#{task['id']}]</code>\n"
-        f"🏷 {task['category'].capitalize()} 📌 {t_label}\n"
-        f"🕐{sched_text}{text_block}"
+        f"🏷 {task['category'].capitalize()} 📌 {t_label}"
+        f"{sched_part}{text_block}"
     )
 
 

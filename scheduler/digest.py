@@ -293,9 +293,12 @@ async def process_expired_morning_tasks(bot: Bot, chat_id: int):
             # Просрочена = её день уже прошел (для старых задач это то же самое,
             # что «создана раньше вчерашнего дня»)
             if morning_due_date(task_dict, tz) < today_date:
-                expired_text = f"⏰ <b>Вчерашняя задача не выполнена:</b>\n\n<b>{task_dict['title']}</b>"
-                if task_dict.get('text'):
-                    expired_text += f"\n<i>{task_dict['text']}</i>"
+                title = (task_dict.get('title') or '').strip()
+                body = (task_dict.get('text') or '').strip()
+                expired_text = f"⏰ <b>Вчерашняя задача не выполнена:</b>\n\n<b>{escape(title)}</b>"
+                # У задач «на день» заголовок и текст совпадают — не дублируем
+                if body and body != title:
+                    expired_text += f"\n<i>{escape(body)}</i>"
 
                 kb = InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="❌ Закрыть уведомление", callback_data="close_message")]
