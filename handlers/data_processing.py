@@ -27,6 +27,10 @@ def get_data_processing_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🎙 Транскрибация", callback_data="data_transcribe"),
             InlineKeyboardButton(text="📓 Obsidian", callback_data="data_obsidian"),
         ],
+        [
+            InlineKeyboardButton(text="🔐 2FA", callback_data="tfa:menu"),
+            InlineKeyboardButton(text="➖", callback_data="data_stub"),
+        ],
     ]
 
     # "Мой IP" и все сервисы из реестра пакуются по 2 в ряд — так они не

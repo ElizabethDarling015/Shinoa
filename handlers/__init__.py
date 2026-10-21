@@ -4,7 +4,7 @@
 
 from aiogram import Router
 
-from handlers import services_control, weekly, monthly, daily, list_tasks, snooze, habits, archive, stats, settings, data_processing, proxy
+from handlers import services_control, totp, weekly, monthly, daily, list_tasks, snooze, habits, archive, stats, settings, data_processing, proxy
 
 main_router = Router()
 # services_control — ПЕРВЫМ: его message-хендлеры узко привязаны к конкретному
@@ -14,6 +14,9 @@ main_router = Router()
 # число без проверки состояния и, стоя раньше в списке, перехватывал ответы
 # на "На сколько часов?" ещё до того, как они доходили до services_control.
 main_router.include_router(services_control.router)
+# totp — тоже рано: шаги «название»/«ключ» ловят обычный текст и не должны
+# уступать его архиву (идеи/поиск)
+main_router.include_router(totp.router)
 main_router.include_router(proxy.router)
 main_router.include_router(weekly.router)
 main_router.include_router(monthly.router)

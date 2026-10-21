@@ -51,4 +51,10 @@ class ViewStateCleanupMiddleware(BaseMiddleware):
             from handlers.services_control import _clear_view
             _clear_view(cq.message.chat.id, cq.message.message_id)
 
+        # То же для 2FA: сообщение с кодом ушло под другой экран —
+        # отложенное «скрыть код» не должно его перезаписать
+        if cq and cq.message and not (cq.data or "").startswith("tfa:"):
+            from handlers.totp import forget_view
+            forget_view(cq.message.chat.id, cq.message.message_id)
+
         return await handler(event, data)
