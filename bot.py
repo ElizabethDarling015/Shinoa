@@ -14,6 +14,7 @@ from pathlib import Path
 import argparse
 
 from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
@@ -339,7 +340,12 @@ async def main():
     # ──────────────────────────────────────────
     # Создание бота с сессией, поддерживающей переключение прокси
     # ──────────────────────────────────────────
-    bot = Bot(token=BOT_TOKEN, session=ProxySwitchableSession())
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=ProxySwitchableSession(),
+        # Превью ссылок выключены во всех сообщениях бота по умолчанию
+        default=DefaultBotProperties(link_preview_is_disabled=True),
+    )
     dp = Dispatcher(storage=MemoryStorage())
 
     # ──────────────────────────────────────────
