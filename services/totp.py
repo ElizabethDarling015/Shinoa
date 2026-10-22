@@ -1,27 +1,15 @@
 """
 Локальный генератор кодов 2FA (TOTP, RFC 6238) — без сторонних сайтов.
-
-Секретные ключи хранятся в БД только в зашифрованном виде (Fernet).
-Ключ шифрования берётся из переменной TOTP_KEY в .env, а если её нет —
-из файла var/totp.key, который создаётся автоматически при первом
-обращении (папка var/ не попадает в git).
-
-ВАЖНО: без этого ключа сохранённые секреты расшифровать нельзя.
-Если переносишь базу на другую машину — переноси и var/totp.key.
+Ничего не хранит: считает код по ключу, который прислали.
 """
 
 import base64
 import hashlib
 import hmac
-import os
 import struct
 import time
-from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
-from cryptography.fernet import Fernet, InvalidToken
-
-KEY_FILE = Path(__file__).resolve().parent.parent / "var" / "totp.key"
 
 ALGORITHMS = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256, "SHA512": hashlib.sha512}
 
@@ -94,43 +82,3 @@ def parse_user_input(text: str) -> dict | None:
         return {"secret": normalize_secret(text), "digits": 6, "period": 30,
                 "algorithm": "SHA1", "label": ""}
     return None
-
-
-# ──────────────────────────────────────────────
-# Шифрование секретов в БД
-# ──────────────────────────────────────────────
-
-_fernet: Fernet | None = None
-
-
-def _get_fernet() -> Fernet:
-    global _fernet
-    if _fernet is not None:
-        return _fernet
-
-    key = os.getenv("TOTP_KEY", "").strip()
-    if not key:
-        KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if KEY_FILE.exists():
-            key = KEY_FILE.read_text().strip()
-        else:
-            key = Fernet.generate_key().decode()
-            # Файл создаётся сразу с правами 600 — читать может только владелец
-            fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(key + "\n")
-
-    _fernet = Fernet(key.encode())
-    return _fernet
-
-
-def encrypt_secret(secret: str) -> str:
-    return _get_fernet().encrypt(secret.encode()).decode()
-
-
-def decrypt_secret(token: str) -> str | None:
-    """None — если ключ шифрования не тот (например, база перенесена без var/totp.key)."""
-    try:
-        return _get_fernet().decrypt(token.encode()).decode()
-    except InvalidToken:
-        return None
